@@ -7,6 +7,7 @@ package mr
 //
 
 import "os"
+import "fmt"
 import "strconv"
 
 //
@@ -24,6 +25,31 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type TaskInfo struct {
+	NReduce, M int
+	// m -- worker number
+}
+
+type MapArgs struct {
+	Pid int
+}
+
+type MapReply struct {
+	filename, content string
+	finish bool
+}
+
+type ReduceArgs struct {
+
+}
+
+type ReduceReply struct {
+
+}
+
+func debug(s interface{}) {
+	fmt.Println(s)
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
