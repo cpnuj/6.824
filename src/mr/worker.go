@@ -49,89 +49,121 @@ func Worker(mapf func(string, string) []KeyValue,
 	pid, taskinfo := os.Getpid(), TaskInfo{}
 	call("Master.InitWorker", &pid, &taskinfo)
 	
-	HandleMap(mapf, &taskinfo)
+	HandleMap(mapf, pid, &taskinfo)
 
-	HandleReduce(reducef, &taskinfo)
-
-	// deal with reduce
+	HandleReduce(reducef, pid,  &taskinfo)
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
 
 }
 
-func HandleMap(mapf func(string, string) []KeyValue, taskinfo *TaskInfo) error {
-	var (
-		tasknum int
-		response int
-	)
-	
-	pid := os.Getpid()
+func ReadContent(filename string) string{
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
 
-	for {
-		call("Master.MapTask", &pid, &tasknum)
-		if tasknum == MAP_DONE {
-			// fmt.Printf("Map Procedure is over\n")
-			return nil
+	return string(content)
+}
+
+func WriteBuckets(kvs []KeyValue, nReduce int, tasknum int) []string {
+	buffer, tempfiles := make([]string, nReduce), make([]string, nReduce)
+
+	for _, kv := range kvs {
+		n := ihash(kv.Key) % nReduce
+		tmpstr := fmt.Sprintf("%v %v\n", kv.Key, kv.Value)
+		buffer[n] = buffer[n] + tmpstr
+	}
+
+	for n, s := range buffer {
+		pattern := "mr-out-" + strconv.Itoa(n) + "-" + strconv.Itoa(tasknum) + "-"
+		ofile, err := ioutil.TempFile("./", pattern)
+		if err != nil {
+			log.Fatalf("cannot create temp file has pattern %s", pattern)
 		}
-		if tasknum == NO_TASK {
-			// fmt.Printf("There is no needed map task\n")
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		// fmt.Printf("Take task %d\n", tasknum)
-		nReduce, filename := taskinfo.NReduce, taskinfo.Filenames[tasknum]
-		intermediate := []KeyValue{}
+		tempfiles[n] = ofile.Name()
+		fmt.Fprintf(ofile, s)
+		ofile.Close()
+	}
+
+	return tempfiles
+}
+
+func ReadBuckets(tasknum int) ([]KeyValue, []string) {
+	pattern := "mr-out-" + strconv.Itoa(tasknum) + "-*"
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		log.Fatalf("cannot open file %s" + pattern)
+	}
+
+	kvs := []KeyValue{}
+	for _, filename := range files {
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
 		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", filename)
+		reader := bufio.NewReader(file)
+		for {
+			var key, value string
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				break
+			}
+			fmt.Sscanf(line, "%s %s", &key, &value)
+			kv := KeyValue{key, value}
+			kvs = append(kvs, kv)
 		}
 		file.Close()
+	}
 
-		kva := mapf(filename, string(content))
-		intermediate = append(intermediate, kva...)
+	sort.Sort(ByKey(kvs))
 
-		//
-		// Write to disk
-		//
+	return kvs, files
+}
 
-		buffer, tmpfiles := make([]string, nReduce), make([]string, nReduce)
-		for _, kv := range intermediate {
-			n := ihash(kv.Key) % nReduce
-			tmpstr := fmt.Sprintf("%v %v\n", kv.Key, kv.Value)
-			buffer[n] = buffer[n] + tmpstr
+func ClearBuckets(files []string) {
+	for _, filename := range files {
+		os.Remove(filename)
+	}
+}
+
+func HandleMap(mapf func(string, string) []KeyValue, pid int, taskinfo *TaskInfo) error {
+	var tasknum, response int
+	nReduce := taskinfo.NReduce
+	for {
+		call("Master.MapTask", &pid, &tasknum)
+		if tasknum == MAP_DONE {
+			return nil
 		}
-		for n, s := range buffer {
-			pattern := "mr-out-" + strconv.Itoa(n) + "-" + strconv.Itoa(tasknum) + "-"
-			ofile, err := ioutil.TempFile("./", pattern)
-			if err != nil {
-				log.Fatalf("cannot create temp file has pattern %s", pattern)
-			}
-			tmpfiles[n] = ofile.Name()
-			fmt.Fprintf(ofile, s)
-			ofile.Close()
+		if tasknum == NO_TASK {
+			time.Sleep(5 * time.Second)
+			continue
 		}
+
+		filename := taskinfo.Filenames[tasknum]
+		content := ReadContent(filename)
+		kvs := mapf(filename, content)
+
+
+		tempfiles := WriteBuckets(kvs, nReduce, tasknum)
 		
 		call("Master.FinishMap", &tasknum, &response)
 		if response == ABORT {
-			// fmt.Printf("Get responce: ABORT")
-			for _, filename := range tmpfiles {
+			for _, filename := range tempfiles {
 				os.Remove(filename)
 			}
 		}
 	}
 }
 
-func HandleReduce(reducef func(string, []string) string, taskinfo *TaskInfo) error {
-	var (
-		tasknum int
-		response int
-	)
-	pid := os.Getpid()
+func HandleReduce(reducef func(string, []string) string, pid int, taskinfo *TaskInfo) error {
+	var tasknum, response int
 	for {
 		call("Master.ReduceTask", &pid, &tasknum)
 		if tasknum == REDUCE_DONE {
@@ -142,64 +174,35 @@ func HandleReduce(reducef func(string, []string) string, taskinfo *TaskInfo) err
 			continue
 		}
 		
-		pattern := "mr-out-" + strconv.Itoa(tasknum) + "-*"
-		files, err := filepath.Glob(pattern)
-		if err != nil {
-			log.Fatalf("cannot open file %s" + pattern)
-		}
-
-		// read files kv pairs into intermediate
-		intermediate := []KeyValue{}
-		for _, filename := range files {
-			file, err := os.Open(filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", filename)
-			}
-			reader := bufio.NewReader(file)
-			for {
-				var key, value string
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					break
-				}
-				fmt.Sscanf(line, "%s %s", &key, &value)
-				kv := KeyValue{key, value}
-				intermediate = append(intermediate, kv)
-			}
-			file.Close()
-			// os.Remove(filename)
-		}
-
-		sort.Sort(ByKey(intermediate))
+		kvs, files := ReadBuckets(tasknum)
 
 		//
-		// call Reduce on each distinct key in intermediate[],
-		// and print the result to mr-out-nTarget.
+		// call Reduce on each distinct key in kvs[],
+		// and print the result to mr-out-tasknum.
 		//
 
-		tmpfile, err := ioutil.TempFile("./", "mr-out-" + strconv.Itoa(tasknum) + "-")
+		tmpfile, _ := ioutil.TempFile("./", "mr-out-" + strconv.Itoa(tasknum) + "-")
 		i := 0
-		for i < len(intermediate) {
+		for i < len(kvs) {
 			j := i + 1
-			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			for j < len(kvs) && kvs[j].Key == kvs[i].Key {
 				j++
 			}
 			values := []string{}
 			for k := i; k < j; k++ {
-				values = append(values, intermediate[k].Value)
+				values = append(values, kvs[k].Value)
 			}
-			output := reducef(intermediate[i].Key, values)
+			output := reducef(kvs[i].Key, values)
 
 			// this is the correct format for each line of Reduce output.
-			fmt.Fprintf(tmpfile, "%v %v\n", intermediate[i].Key, output)
+			fmt.Fprintf(tmpfile, "%v %v\n", kvs[i].Key, output)
 
 			i = j
 		}
+		
 		call("Master.FinishReduce", &tasknum, &response)
 		if response == OK {
-			for _, filename := range files {
-				os.Remove(filename)
-			}
+			ClearBuckets(files)
 			os.Rename(tmpfile.Name(), "mr-out-" + strconv.Itoa(tasknum))			
 		} else {
 			os.Remove(tmpfile.Name())
@@ -227,7 +230,7 @@ func CallExample() {
 	call("Master.Example", &args, &reply)
 
 	// reply.Y should be 100.
-	// fmt.Printf("reply.Y %v\n", reply.Y)
+	fmt.Printf("reply.Y %v\n", reply.Y)
 }
 
 //
