@@ -48,17 +48,17 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	pid, taskinfo := os.Getpid(), TaskInfo{}
 	call("Master.InitWorker", &pid, &taskinfo)
-	
+
 	HandleMap(mapf, pid, &taskinfo)
 
-	HandleReduce(reducef, pid,  &taskinfo)
+	HandleReduce(reducef, pid, &taskinfo)
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
 
 }
 
-func ReadContent(filename string) string{
+func ReadContent(filename string) string {
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -74,13 +74,11 @@ func ReadContent(filename string) string{
 
 func WriteBuckets(kvs []KeyValue, nReduce int, tasknum int) []string {
 	buffer, tempfiles := make([]string, nReduce), make([]string, nReduce)
-
 	for _, kv := range kvs {
 		n := ihash(kv.Key) % nReduce
 		tmpstr := fmt.Sprintf("%v %v\n", kv.Key, kv.Value)
 		buffer[n] = buffer[n] + tmpstr
 	}
-
 	for n, s := range buffer {
 		pattern := "mr-out-" + strconv.Itoa(n) + "-" + strconv.Itoa(tasknum) + "-"
 		ofile, err := ioutil.TempFile("./", pattern)
@@ -91,7 +89,6 @@ func WriteBuckets(kvs []KeyValue, nReduce int, tasknum int) []string {
 		fmt.Fprintf(ofile, s)
 		ofile.Close()
 	}
-
 	return tempfiles
 }
 
@@ -150,9 +147,8 @@ func HandleMap(mapf func(string, string) []KeyValue, pid int, taskinfo *TaskInfo
 		content := ReadContent(filename)
 		kvs := mapf(filename, content)
 
-
 		tempfiles := WriteBuckets(kvs, nReduce, tasknum)
-		
+
 		call("Master.FinishMap", &tasknum, &response)
 		if response == ABORT {
 			for _, filename := range tempfiles {
@@ -173,7 +169,7 @@ func HandleReduce(reducef func(string, []string) string, pid int, taskinfo *Task
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		
+
 		kvs, files := ReadBuckets(tasknum)
 
 		//
@@ -181,7 +177,7 @@ func HandleReduce(reducef func(string, []string) string, pid int, taskinfo *Task
 		// and print the result to mr-out-tasknum.
 		//
 
-		tmpfile, _ := ioutil.TempFile("./", "mr-out-" + strconv.Itoa(tasknum) + "-")
+		tmpfile, _ := ioutil.TempFile("./", "mr-out-"+strconv.Itoa(tasknum)+"-")
 		i := 0
 		for i < len(kvs) {
 			j := i + 1
@@ -199,11 +195,11 @@ func HandleReduce(reducef func(string, []string) string, pid int, taskinfo *Task
 
 			i = j
 		}
-		
+
 		call("Master.FinishReduce", &tasknum, &response)
 		if response == OK {
 			ClearBuckets(files)
-			os.Rename(tmpfile.Name(), "mr-out-" + strconv.Itoa(tasknum))			
+			os.Rename(tmpfile.Name(), "mr-out-"+strconv.Itoa(tasknum))
 		} else {
 			os.Remove(tmpfile.Name())
 		}
