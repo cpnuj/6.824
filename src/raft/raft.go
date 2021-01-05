@@ -261,6 +261,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	DPrintf("node%d has been killed.\n", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -276,6 +277,9 @@ func (rf *Raft) runAsFollower() {
 	// if receive heartbeat, reset timer
 	// if timeout, return
 	for {
+		if rf.killed() {
+			return
+		}
 		select {
 		case <-rf.hbch:
 			if !rf.timer.Stop() {
@@ -350,6 +354,9 @@ func (rf *Raft) runAsLeader() {
 	args, replys := AppendEntriesArgs{}, AppendEntriesReply{}
 	rf.timer = time.NewTimer(100 * time.Millisecond)
 	for {
+		if rf.killed() {
+			return
+		}
 		<-rf.timer.C
 		for i, _ := range rf.peers {
 			if i == rf.me {
@@ -366,6 +373,9 @@ func (rf *Raft) runAsLeader() {
 // Raft node main goroutine
 func (rf *Raft) begin() {
 	for {
+		if rf.killed() {
+			return
+		}
 		switch rf.role {
 		case FOLLOWER:
 			rf.runAsFollower()

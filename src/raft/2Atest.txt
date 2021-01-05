@@ -1,0 +1,26 @@
+2021/01/05 20:06:04 Init node: NO: 0, timeout: 1277ms
+2021/01/05 20:06:04 Init node: NO: 1, timeout: 1830ms
+2021/01/05 20:06:04 Init node: NO: 2, timeout: 1586ms
+Test (2A): initial election ...
+2021/01/05 20:06:05 node0 timeout
+2021/01/05 20:06:05 node: 2, term: 0 receive vote request from node: 0, term: 1
+2021/01/05 20:06:05 node: 1, term: 0 receive vote request from node: 0, term: 1
+  ... Passed --   4.0  3   54    6646    0
+2021/01/05 20:06:08 Init node: NO: 0, timeout: 1476ms
+2021/01/05 20:06:08 Init node: NO: 1, timeout: 1243ms
+2021/01/05 20:06:08 Init node: NO: 2, timeout: 1682ms
+Test (2A): election after network failure ...
+2021/01/05 20:06:09 node1 timeout
+2021/01/05 20:06:09 node: 2, term: 0 receive vote request from node: 1, term: 1
+2021/01/05 20:06:09 node: 0, term: 0 receive vote request from node: 1, term: 1
+2021/01/05 20:06:10 node2 timeout
+2021/01/05 20:06:10 node1 timeout
+2021/01/05 20:06:11 node0 timeout
+2021/01/05 20:06:11 node: 2, term: 1 receive vote request from node: 0, term: 2
+2021/01/05 20:06:13 node2 timeout
+2021/01/05 20:06:14 node: 0 is dead
+2021/01/05 20:06:14 node: 2 is dead
+2021/01/05 20:06:14 node: 1 is dead
+  ... Passed --   6.6  3  180   13040    0
+PASS
+ok  	_/home/shikamaru/code/6.824/src/raft	10.552s
