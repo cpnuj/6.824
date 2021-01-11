@@ -357,7 +357,6 @@ func (rf *Raft) runAsLeader() {
 		if rf.killed() {
 			return
 		}
-		<-rf.timer.C
 		for i, _ := range rf.peers {
 			if i == rf.me {
 				continue
@@ -367,6 +366,7 @@ func (rf *Raft) runAsLeader() {
 			}(i)
 		}
 		rf.timer.Reset(100 * time.Millisecond)
+		<-rf.timer.C
 	}
 }
 
