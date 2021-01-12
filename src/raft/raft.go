@@ -46,8 +46,8 @@ type ApplyMsg struct {
 
 // timeout settings (ms)
 const (
-	MaxTimeout int = 2000
-	MinTimeout int = 1000
+	MaxTimeout int = 1000
+	MinTimeout int = 500
 )
 
 // indicate Raft node's role
@@ -86,6 +86,9 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
+	if rf.killed() {
+		return rf.term, false
+	}
 	term, isleader := rf.term, rf.role == LEADER
 	return term, isleader
 }
@@ -285,6 +288,7 @@ func (rf *Raft) runAsFollower() {
 			if !rf.timer.Stop() {
 				<-rf.timer.C
 			}
+			DPrintf("node%d receives heartbreak\n", rf.me)
 			rf.timer.Reset(rf.timeout)
 		case <-rf.timer.C:
 			DPrintf("node%d timeout\n", rf.me)
