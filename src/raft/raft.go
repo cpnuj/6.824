@@ -19,13 +19,11 @@ package raft
 
 import "sync"
 import "time"
-import "math/rand"
 import "sync/atomic"
 import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -44,6 +42,11 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Entry struct {
+	Command interface{}
+	Term    int
+}
+
 // timeout settings (ms)
 const (
 	MaxTimeout int = 1000
@@ -52,8 +55,8 @@ const (
 
 // indicate Raft node's role
 const (
-	LEADER = 1
-	FOLLOWER = 2
+	LEADER    = 1
+	FOLLOWER  = 2
 	CANDIDATE = 3
 )
 
@@ -79,7 +82,18 @@ type Raft struct {
 	// fileds for election timeout
 	// timeout is must between 250 - 500 ms
 	timeout time.Duration
-	timer	*time.Timer
+	timer   *time.Timer
+
+	// log entries
+	log []Entry
+
+	// Volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -109,7 +123,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -132,14 +145,13 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int
+	Term        int
 	CandidateID int
 }
 
@@ -149,7 +161,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term int
+	Term        int
 	VoteGranted bool
 }
 
@@ -210,20 +222,57 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // AppendEntries RPC
 type AppendEntriesArgs struct {
-	Term int
-	CandidateID int
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term int
-	VoteGranted bool
+	Succ bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if args.Term < rf.term {
+	reply.Term = rf.term
+
+	// the sent entries is empty means this rpc acts for heartbreak
+	if len(args.Entries) == 0 {
+		reply.Succ = true
+		rf.hbch <- 1
 		return
 	}
-	// If the peer receives this AppendEntries RPC, 
+
+	// leader term < peer term
+	if args.Term < rf.term {
+		reply.Succ = false
+		return
+	}
+
+	// peer's log doesn't contain entry at prevLogIndex whose term
+	// matches prevLogTerm
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Succ = false
+		return
+	}
+
+	// delete entries after prevLogIndex
+	// apply new entries received from leader
+	rf.mu.Lock()
+	rf.log = rf.log[:args.PrevLogIndex+1]
+	rf.log = append(rf.log, args.Entries...)
+	rf.mu.Unlock()
+
+	// update commit index
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	}
+
+	reply.Succ = true
+
+	// If the peer receives this AppendEntries RPC,
 	// then trigger its heartbreak channel
 	rf.hbch <- 1
 }
@@ -249,12 +298,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
 
+	// DPrintf("node%d receives command: ", rf.me)
+	// fmt.Println(command)
+
+	index, term := rf.lastApplied+1, rf.term
+	_, isLeader := rf.GetState()
+
+	if isLeader == true {
+		rf.lastApplied++
+		entry := Entry{command, rf.term}
+		rf.log = append(rf.log, entry)
+	}
 
 	return index, term, isLeader
 }
@@ -273,7 +329,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	DPrintf("node%d has been killed.\n", rf.me)
+	// DPrintf("node%d has been killed.\n", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -282,7 +338,7 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) runAsFollower() {
-	// reset timer 
+	// reset timer
 	rf.timer = time.NewTimer(rf.timeout)
 	defer rf.timer.Stop()
 
@@ -300,7 +356,7 @@ func (rf *Raft) runAsFollower() {
 			// DPrintf("node%d receives heartbreak\n", rf.me)
 			rf.timer.Reset(rf.timeout)
 		case <-rf.timer.C:
-			DPrintf("node%d timeout\n", rf.me)
+			// DPrintf("node%d timeout\n", rf.me)
 			rf.role = CANDIDATE
 			return
 		}
@@ -311,10 +367,10 @@ func (rf *Raft) runAsCandidate() {
 	rf.mu.Lock()
 	rf.term++
 	args := RequestVoteArgs{
-		Term: rf.term,
+		Term:        rf.term,
 		CandidateID: rf.me,
 	}
-	DPrintf("node%d becomes candidate in term%d.\n", rf.me, rf.term)
+	// DPrintf("node%d becomes candidate in term%d.\n", rf.me, rf.term)
 	rf.mu.Unlock()
 
 	replys := make([]RequestVoteReply, len(rf.peers))
@@ -348,7 +404,7 @@ func (rf *Raft) runAsCandidate() {
 			if replys[server].VoteGranted == true {
 				votes++
 			}
-			if votes >= (len(rf.peers) + 1) / 2 {
+			if votes >= (len(rf.peers)+1)/2 {
 				rf.role = LEADER
 				return
 			}
@@ -364,38 +420,83 @@ func (rf *Raft) runAsCandidate() {
 	}
 }
 
+const HB_PERIOD = 100 // heartbrak interval
+
 func (rf *Raft) runAsLeader() {
 	DPrintf("node%d becomes leader in term%d.\n", rf.me, rf.term)
-	args   := AppendEntriesArgs{rf.term, rf.me}
-	replys := AppendEntriesReply{}
-	rf.timer = time.NewTimer(100 * time.Millisecond)
-	defer func() {
-		if !rf.timer.Stop() {
-			<-rf.timer.C
-		}
-	}()
 
-	for {
-		if rf.killed() {
-			return
-		}
-		for i, _ := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(server int) {
-				rf.sendAppendEntries(server, &args, &replys)
-			}(i)
-		}
-		rf.timer.Reset(100 * time.Millisecond)
-		select {
-		case <-rf.timer.C:
-			continue
-		case <-rf.hbch:
-			rf.role = FOLLOWER
-			return
-		}
+	// init nextIndex and matchIndex
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i, _ := range rf.nextIndex {
+		rf.nextIndex[i] = rf.lastApplied + 1
 	}
+
+	// Worker thread func for sending append entries
+
+	var worker func(int, chan bool)
+
+	// i: the i-th server  quit: quit channel
+	worker = func(i int, quit chan bool) {
+
+		args, reply := AppendEntriesArgs{}, AppendEntriesReply{}
+		args.Term = rf.term
+		args.LeaderID = rf.me
+
+		// set timer
+		timer := time.NewTimer(HB_PERIOD * time.Millisecond)
+
+		for {
+			if rf.lastApplied >= rf.nextIndex[i] {
+				// Build RPC args
+				args.PrevLogIndex = rf.nextIndex[i] - 1
+				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+				args.LeaderCommit = rf.commitIndex
+				args.Entries = rf.log[rf.nextIndex[i]:]
+			} else {
+				args.Entries = args.Entries[:0]
+			}
+			if ok := rf.sendAppendEntries(i, &args, &reply); ok {
+				if reply.Succ {
+					rf.nextIndex[i] += len(args.Entries)
+					rf.matchIndex[i] = rf.nextIndex[i] - 1
+				} else {
+					rf.nextIndex[i]--
+				}
+			}
+
+			select {
+			case <-timer.C:
+				timer.Reset(HB_PERIOD * time.Millisecond)
+				continue
+			case <-quit:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			}
+		}
+
+	}
+
+	quit := make([]chan bool, len(rf.peers))
+
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go worker(i, quit[i])
+	}
+
+	<-rf.hbch
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		quit[i] <- true
+	}
+	rf.role = FOLLOWER
+	return
 }
 
 // Raft node main goroutine
@@ -427,10 +528,6 @@ func (rf *Raft) begin() {
 // for any long-running work.
 //
 
-func rangeRand(max, min int) int {
-	return rand.Intn(max - min) + min
-}
-
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -444,7 +541,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.hbch = make(chan int)
 	rf.timeout = time.Duration(rangeRand(MaxTimeout, MinTimeout)) * time.Millisecond
 
-	DPrintf("Init node: NO: %d, timeout: %dms\n", rf.me, rf.timeout / time.Millisecond)
+	rf.log = make([]Entry, 1)
+	rf.log[0] = Entry{ Term: 0 }
+	rf.commitIndex, rf.lastApplied = 0, 0
+
+	DPrintf("Init node%d with timeout %dms\n", rf.me, rf.timeout/time.Millisecond)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
