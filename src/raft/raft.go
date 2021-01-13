@@ -159,11 +159,14 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	DPrintf("node: %d, term: %d receive vote request from node: %d, term: %d\n", rf.me, rf.term, args.CandidateID, args.Term)
+	// DPrintf("node: %d, term: %d receive vote request from node: %d, term: %d\n", rf.me, rf.term, args.CandidateID, args.Term)
 	if rf.term < args.Term {
 		rf.term = args.Term
 		reply.Term = args.Term
 		reply.VoteGranted = true
+		// If the peer receives the RequestVote RPC,
+		// then trigger the heartbreak channel
+		rf.hbch <- 1
 	} else {
 		reply.Term = rf.term
 		reply.VoteGranted = false
@@ -217,10 +220,16 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.term {
+		return
+	}
+	// If the peer receives this AppendEntries RPC, 
+	// then trigger its heartbreak channel
 	rf.hbch <- 1
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// DPrintf("node%d send heartbreak to node%d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -288,7 +297,7 @@ func (rf *Raft) runAsFollower() {
 			if !rf.timer.Stop() {
 				<-rf.timer.C
 			}
-			DPrintf("node%d receives heartbreak\n", rf.me)
+			// DPrintf("node%d receives heartbreak\n", rf.me)
 			rf.timer.Reset(rf.timeout)
 		case <-rf.timer.C:
 			DPrintf("node%d timeout\n", rf.me)
@@ -305,6 +314,7 @@ func (rf *Raft) runAsCandidate() {
 		Term: rf.term,
 		CandidateID: rf.me,
 	}
+	DPrintf("node%d becomes candidate in term%d.\n", rf.me, rf.term)
 	rf.mu.Unlock()
 
 	replys := make([]RequestVoteReply, len(rf.peers))
@@ -355,8 +365,16 @@ func (rf *Raft) runAsCandidate() {
 }
 
 func (rf *Raft) runAsLeader() {
-	args, replys := AppendEntriesArgs{}, AppendEntriesReply{}
+	DPrintf("node%d becomes leader in term%d.\n", rf.me, rf.term)
+	args   := AppendEntriesArgs{rf.term, rf.me}
+	replys := AppendEntriesReply{}
 	rf.timer = time.NewTimer(100 * time.Millisecond)
+	defer func() {
+		if !rf.timer.Stop() {
+			<-rf.timer.C
+		}
+	}()
+
 	for {
 		if rf.killed() {
 			return
@@ -370,7 +388,13 @@ func (rf *Raft) runAsLeader() {
 			}(i)
 		}
 		rf.timer.Reset(100 * time.Millisecond)
-		<-rf.timer.C
+		select {
+		case <-rf.timer.C:
+			continue
+		case <-rf.hbch:
+			rf.role = FOLLOWER
+			return
+		}
 	}
 }
 
