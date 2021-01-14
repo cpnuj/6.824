@@ -73,6 +73,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	applyCh chan ApplyMsg
 
 	role int // peer's role. leader, follower or candidate.
 	term int // peer's current term
@@ -86,6 +87,7 @@ type Raft struct {
 
 	// log entries
 	log []Entry
+	nagree []int
 
 	// Volatile state on all servers
 	commitIndex int
@@ -236,18 +238,19 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// DPrintf("node%d receives heartbreak from node%d", rf.me, args.LeaderID)
 	reply.Term = rf.term
+
+	// leader term < peer term
+	if args.Term < rf.term {
+		reply.Succ = false
+		return
+	}
 
 	// the sent entries is empty means this rpc acts for heartbreak
 	if len(args.Entries) == 0 {
 		reply.Succ = true
 		rf.hbch <- 1
-		return
-	}
-
-	// leader term < peer term
-	if args.Term < rf.term {
-		reply.Succ = false
 		return
 	}
 
@@ -267,7 +270,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// update commit index
 	if args.LeaderCommit > rf.commitIndex {
+		oldcommitIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		// send applyMsg with new commit
+		go func() {
+			for i := oldcommitIndex + 1; i <= rf.commitIndex; i++ {
+				amsg := ApplyMsg{}
+				amsg.CommandValid = true
+				amsg.Command = rf.log[i].Command
+				amsg.CommandIndex = i
+				rf.applyCh <- amsg
+			}
+		}()
 	}
 
 	reply.Succ = true
@@ -445,6 +459,10 @@ func (rf *Raft) runAsLeader() {
 
 		// set timer
 		timer := time.NewTimer(HB_PERIOD * time.Millisecond)
+		// immediately stop the timer for sending the first heartbreak
+		if !timer.Stop() {
+			<-timer.C
+		}
 
 		for {
 			if rf.lastApplied >= rf.nextIndex[i] {
@@ -465,21 +483,31 @@ func (rf *Raft) runAsLeader() {
 				}
 			}
 
+			timer.Reset(HB_PERIOD * time.Millisecond)
 			select {
-			case <-timer.C:
-				timer.Reset(HB_PERIOD * time.Millisecond)
-				continue
 			case <-quit:
+				// DPrintf("node%d worker%d quit.\n", rf.me, i)
 				if !timer.Stop() {
 					<-timer.C
 				}
 				return
+			case <-timer.C:
+				continue
 			}
 		}
+	}
+
+	const checkInterval = 500 // check commit period
+	var checkCommit func()
+
+	checkCommit = func() {
 
 	}
 
 	quit := make([]chan bool, len(rf.peers))
+	for i, _ := range quit {
+		quit[i] = make(chan bool)
+	}
 
 	for i, _ := range rf.peers {
 		if i == rf.me {
@@ -489,13 +517,18 @@ func (rf *Raft) runAsLeader() {
 	}
 
 	<-rf.hbch
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
+	// DPrintf("leader node%d receives heartbreak.\n", rf.me)
+	go func() {
+		for i, _ := range rf.peers {
+			// DPrintf("quit worker%d.\n", i)
+			if i == rf.me {
+				continue
+			}
+			quit[i] <- true
 		}
-		quit[i] <- true
-	}
+	}()
 	rf.role = FOLLOWER
+	DPrintf("leader%d becomes follower.\n", rf.me)
 	return
 }
 
@@ -536,6 +569,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
+
 	rf.term = 0
 	rf.role = FOLLOWER
 	rf.hbch = make(chan int)
