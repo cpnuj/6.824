@@ -261,6 +261,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// DPrintf("node%d receives heartbreak from node%d", rf.me, args.LeaderID)
+	// DPrintf("node%d receives append entries %d", rf.me, len(args.Entries))
 	reply.Term = rf.term
 
 	// leader term < peer term
@@ -335,7 +336,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 
-	// DPrintf("node%d receives command", rf.me)
 	// fmt.Println(command)
 
 	rf.mu.Lock()
@@ -344,8 +344,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	_, isLeader := rf.GetState()
 
 	if isLeader == true {
+		// DPrintf("node%d receives command %d", rf.me, len(rf.log))
+
 		rf.lastApplied++
-		// DPrintf("lastApplied:%d", rf.lastApplied)
+		DPrintf("lastApplied:%d", rf.lastApplied)
 
 		rf.nagree = append(rf.nagree, 1)
 		// DPrintf("nagree:%d", len(rf.nagree))
