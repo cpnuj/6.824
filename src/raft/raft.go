@@ -168,7 +168,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
-	VoteGranted bool
+	VoteGranted int
 }
 
 //
@@ -186,24 +186,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// NOTE: if candidate's term == peer's term,
 	// means this peer has voted in this term
 	if rf.term >= args.Term {
-		reply.VoteGranted = false
+		reply.VoteGranted = -1
 		return
 	}
+
+	// the candidate's term > peer's term
+	// update the peer's
+	// although the candidate's log is not more up-to-date
 
 	// check if the candidate's log is more up-to-date
 	if rf.log[rf.lastApplied].Term != args.LastLogTerm {
 		if rf.log[rf.lastApplied].Term > args.LastLogTerm {
-			reply.VoteGranted = false
+			reply.VoteGranted = -1
 			return
 		}
 	} else if rf.lastApplied > args.LastLogIndex {
-		reply.VoteGranted = false
+		reply.VoteGranted = -1
 		return
 	}
 
 	rf.term = args.Term
 	reply.Term = args.Term
-	reply.VoteGranted = true
+	reply.VoteGranted = 1
 
 	// If the peer receives the RequestVote RPC,
 	// then trigger the heartbreak channel
@@ -256,27 +260,26 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	Term int
-	Succ bool
+	Succ int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// DPrintf("node%d receives heartbreak from node%d", rf.me, args.LeaderID)
+	// DPrintf("node%d term %d log len: %d", rf.me, rf.term, len(rf.log))
 	// DPrintf("node%d receives append entries %d", rf.me, len(args.Entries))
 	reply.Term = rf.term
 
 	// leader term < peer term
 	if args.Term < rf.term {
-		reply.Succ = false
+		reply.Succ = -1
 		return
 	}
 
-	// DPrintf("peer%d receives entries", rf.me)
 	// fmt.Println(args)
 
 	// peer's log doesn't contain entry at prevLogIndex whose term
 	// matches prevLogTerm
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Succ = false
+		reply.Succ = -1
 		return
 	}
 
@@ -306,7 +309,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}()
 	}
 
-	reply.Succ = true
+
+	reply.Succ = 1
 
 	// If the peer receives this AppendEntries RPC,
 	// then trigger its heartbreak channel
@@ -347,7 +351,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// DPrintf("node%d receives command %d", rf.me, len(rf.log))
 
 		rf.lastApplied++
-		DPrintf("lastApplied:%d", rf.lastApplied)
 
 		rf.nagree = append(rf.nagree, 1)
 		// DPrintf("nagree:%d", len(rf.nagree))
@@ -401,7 +404,7 @@ func (rf *Raft) runAsFollower() {
 			// DPrintf("node%d receives heartbreak\n", rf.me)
 			rf.timer.Reset(rf.timeout)
 		case <-rf.timer.C:
-			// DPrintf("node%d timeout\n", rf.me)
+			DPrintf("node%d timeout\n", rf.me)
 			rf.role = CANDIDATE
 			return
 		}
@@ -415,7 +418,7 @@ func (rf *Raft) runAsCandidate() {
 		Term:        rf.term,
 		CandidateID: rf.me,
 	}
-	// DPrintf("node%d becomes candidate in term%d.\n", rf.me, rf.term)
+	DPrintf("node%d becomes candidate in term%d.\n", rf.me, rf.term)
 	rf.mu.Unlock()
 
 	replys := make([]RequestVoteReply, len(rf.peers))
@@ -446,7 +449,7 @@ func (rf *Raft) runAsCandidate() {
 			if server < 0 {
 				continue
 			}
-			if replys[server].VoteGranted == true {
+			if replys[server].VoteGranted == 1 {
 				votes++
 			}
 			if votes >= (len(rf.peers)+1)/2 {
@@ -456,16 +459,141 @@ func (rf *Raft) runAsCandidate() {
 		// receive heartbreak
 		case <-rf.hbch:
 			rf.role = FOLLOWER
+			DPrintf("node%d lose the election in term%da", rf.me, rf.term)
 			return
 		// timer elapse
 		case <-rf.timer.C:
 			rf.role = CANDIDATE
+			DPrintf("node%d term%d election timeout", rf.me, rf.term)
 			return
 		}
 	}
 }
 
 const HB_PERIOD = 100 // heartbrak interval
+
+// goroutine for Leader to send append entries RPC
+func (rf *Raft) appendEntriesSender(i int, quit chan bool) {
+
+	args, reply := AppendEntriesArgs{}, AppendEntriesReply{}
+	args.Term = rf.term
+	args.LeaderID = rf.me
+
+	// set timer
+	timer := time.NewTimer(HB_PERIOD * time.Millisecond)
+	// immediately stop the timer for sending the first heartbreak
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	for {
+		if rf.killed() {
+			return
+		}
+		// Build RPC args
+		rf.mu.Lock()
+		DPrintf("term%d node%d building rpc for node%d", rf.term, rf.me, i)
+		DPrintf("node%d nextIndex: %d, log len: %d", i, rf.nextIndex[i], len(rf.log))
+
+		args.PrevLogIndex = rf.nextIndex[i] - 1
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		args.LeaderCommit = rf.commitIndex
+
+		if rf.lastApplied >= rf.nextIndex[i] {
+			args.Entries = rf.log[rf.nextIndex[i]:]
+
+		} else {
+			args.Entries = args.Entries[:0]
+		}
+
+		rf.mu.Unlock()
+
+		if ok := rf.sendAppendEntries(i, &args, &reply); ok {
+			if reply.Succ == 1 {
+				begin := rf.nextIndex[i]
+				rf.nextIndex[i] += len(args.Entries)
+				rf.matchIndex[i] = rf.nextIndex[i] - 1
+				end := rf.matchIndex[i]
+				// Update nagree asyn
+				go func(begin, end int) {
+				// TODO use rwlocker to replace mutex
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					for i := begin; i <= end; i++ {
+						rf.nagree[i]++
+						// DPrintf("nagree[%d]: %d", i, rf.nagree[i])
+					}
+				}(begin, end)
+			} else {
+				// if the follower's term > leader's term
+				// trigger heartbreak channel
+				if (reply.Term > rf.term) {
+
+					rf.mu.Lock()
+					rf.term = reply.Term
+					rf.mu.Unlock()
+
+					rf.hbch <- 1
+					<-quit
+					return
+				} else {
+					rf.nextIndex[i]--
+				}
+			}
+		}
+
+		timer.Reset(HB_PERIOD * time.Millisecond)
+		select {
+		case <-quit:
+			DPrintf("node%d worker%d quit.\n", rf.me, i)
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+			continue
+		}
+	}
+
+}
+
+func (rf *Raft) checkCommit(quit chan bool) {
+	const checkInterval = 500 // check commit period
+	var nmajority = (len(rf.peers) + 1) / 2  // n to achieve majority agreement
+
+	applymsg := ApplyMsg{}
+	applymsg.CommandValid = true
+
+	timer := time.NewTimer(checkInterval * time.Millisecond)
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	for {
+		timer.Reset(checkInterval * time.Millisecond)
+
+		select {
+		case <-quit:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+			// TODO use rwlocker to replace mutex
+			rf.mu.Lock()
+			for i := rf.commitIndex + 1; i <= rf.lastApplied; i++ {
+				if rf.nagree[i] >= nmajority {
+					rf.commitIndex = i
+					applymsg.Command = rf.log[i].Command
+					applymsg.CommandIndex = i
+					rf.applyCh <- applymsg
+					// DPrintf("commit log %d", i)
+				}
+			}
+			rf.mu.Unlock()
+		}
+	}
+}
 
 func (rf *Raft) runAsLeader() {
 	DPrintf("node%d becomes leader in term%d.\n", rf.me, rf.term)
@@ -482,115 +610,7 @@ func (rf *Raft) runAsLeader() {
 	rf.nagree = make([]int, rf.lastApplied + 1)
 	rf.mu.Unlock()
 
-	// Worker thread func for sending append entries RPC
-	var worker func(int, chan bool)
-
-	// i: the i-th server  quit: quit channel
-	worker = func(i int, quit chan bool) {
-
-		args, reply := AppendEntriesArgs{}, AppendEntriesReply{}
-		args.Term = rf.term
-		args.LeaderID = rf.me
-
-		// set timer
-		timer := time.NewTimer(HB_PERIOD * time.Millisecond)
-		// immediately stop the timer for sending the first heartbreak
-		if !timer.Stop() {
-			<-timer.C
-		}
-
-		for {
-			// Build RPC args
-			rf.mu.Lock()
-
-			args.PrevLogIndex = rf.nextIndex[i] - 1
-			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-			args.LeaderCommit = rf.commitIndex
-
-			if rf.lastApplied >= rf.nextIndex[i] {
-				args.Entries = rf.log[rf.nextIndex[i]:]
-
-			} else {
-				args.Entries = args.Entries[:0]
-			}
-
-			rf.mu.Unlock()
-
-			if ok := rf.sendAppendEntries(i, &args, &reply); ok {
-				if reply.Succ {
-					begin := rf.nextIndex[i]
-					rf.nextIndex[i] += len(args.Entries)
-					rf.matchIndex[i] = rf.nextIndex[i] - 1
-					end := rf.matchIndex[i]
-					// Update nagree asyn
-					go func(begin, end int) {
-					// TODO use rwlocker to replace mutex
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-						for i := begin; i <= end; i++ {
-							rf.nagree[i]++
-							// DPrintf("nagree[%d]: %d", i, rf.nagree[i])
-						}
-					}(begin, end)
-				} else {
-					rf.nextIndex[i]--
-				}
-			}
-
-			timer.Reset(HB_PERIOD * time.Millisecond)
-			select {
-			case <-quit:
-				// DPrintf("node%d worker%d quit.\n", rf.me, i)
-				if !timer.Stop() {
-					<-timer.C
-				}
-				return
-			case <-timer.C:
-				continue
-			}
-		}
-	}
-
-	const checkInterval = 500 // check commit period
-	var nmajority = (len(rf.peers) + 1) / 2  // n to achieve majority agreement
-
-	var checkCommit func(chan bool)
-
-	// TODO use rwlocker to replace mutex
-	checkCommit = func(quit chan bool) {
-		applymsg := ApplyMsg{}
-		applymsg.CommandValid = true
-
-		timer := time.NewTimer(checkInterval * time.Millisecond)
-		if !timer.Stop() {
-			<-timer.C
-		}
-
-		for {
-			timer.Reset(checkInterval * time.Millisecond)
-
-			select {
-			case <-quit:
-				if !timer.Stop() {
-					<-timer.C
-				}
-				return
-			case <-timer.C:
-				rf.mu.Lock()
-				for i := rf.commitIndex + 1; i <= rf.lastApplied; i++ {
-					if rf.nagree[i] >= nmajority {
-						rf.commitIndex = i
-						applymsg.Command = rf.log[i].Command
-						applymsg.CommandIndex = i
-						rf.applyCh <- applymsg
-						DPrintf("commit log %d", i)
-					}
-				}
-				rf.mu.Unlock()
-			}
-		}
-	}
-
+	// init append entries rpc sender
 	quitworker := make([]chan bool, len(rf.peers))
 	for i, _ := range quitworker {
 		quitworker[i] = make(chan bool)
@@ -600,14 +620,16 @@ func (rf *Raft) runAsLeader() {
 		if i == rf.me {
 			continue
 		}
-		go worker(i, quitworker[i])
+		go rf.appendEntriesSender(i, quitworker[i])
 	}
 
 	quitCheck := make(chan bool)
 
-	go checkCommit(quitCheck)
+	// goroutine for checking commit status
+	go rf.checkCommit(quitCheck)
 
-	// receive heartbreak
+	// if leader receive heartbreak
+	// convert to follower
 	<-rf.hbch
 
 	go func() {
@@ -622,6 +644,7 @@ func (rf *Raft) runAsLeader() {
 	quitCheck <- true
 
 	rf.role = FOLLOWER
+	DPrintf("node%d quit leader", rf.me)
 	return
 }
 

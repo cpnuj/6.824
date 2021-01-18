@@ -145,6 +145,7 @@ func TestRPCBytes2B(t *testing.T) {
 }
 
 func TestFailAgree2B(t *testing.T) {
+	time.Sleep(3 * time.Second)
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
