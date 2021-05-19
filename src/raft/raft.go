@@ -3,6 +3,7 @@ package raft
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 //
@@ -67,78 +68,11 @@ const (
 
 const NonVote = -1
 
-type RaftStateMachine struct {
-	id int
-
-	role int // peer's role. leader, follower or candidate.
-	term int // peer's current term
-
-	vote int // peer's vote for this term
-
-	electionTimeout int
-	heartbeatTimeout int
-
-	electionElapsed int
-	heartbeatElapsed int
-
-	tick func()
-	step func(m Message) // step function
-
-	msgs []Message // messages ready to send to other peers
-}
-
-func (rsm *RaftStateMachine) becomeFollower() {
-	rsm.role = FOLLOWER
-	rsm.step = rsm.stepFollower
-}
-
-func (rsm *RaftStateMachine) becomeCandidate() {
-	rsm.role = CANDIDATE
-	rsm.step = rsm.stepCandidate
-}
-
-func (rsm *RaftStateMachine) becomeLeader() {
-	rsm.role = LEADER
-}
-
-func (rsm *RaftStateMachine) stepFollower(m Message) {
-
-}
-
-func (rsm *RaftStateMachine) stepCandidate(m Message) {
-
-}
-
-func (rsm *RaftStateMachine) stepLeader(m Message) {
-
-}
-
-func (rsm *RaftStateMachine) Step(m Message) {
-	if rsm.term < m.Term {
-		rsm.becomeFollower()
-	}
-	rsm.step(m)
-}
-
-func (rsm *RaftStateMachine) tickElection() {
-	rsm.electionElapsed++
-	if rsm.electionElapsed == rsm.electionTimeout {
-		rsm.electionElapsed = 0
-		rsm.term++
-		rsm.becomeCandidate()
-	}
-}
-
-func (rsm *RaftStateMachine) tickHeartbeat() {
-	rsm.heartbeatElapsed++
-	if rsm.heartbeatElapsed == rsm.heartbeatTimeout {
-		rsm.heartbeatElapsed = 0
-		// send heartbeats
-	}
-}
-
-func (rsm *RaftStateMachine) send(msgs []Message) {
-	rsm.msgs = append(rsm.msgs, msgs...)
+type raftLog struct {
+	lastIndex int
+	lastTerm int
+	commit int
+	entries []Entry
 }
 
 //
@@ -155,7 +89,25 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	rsm *RaftStateMachine
+	term int
+	role int
+
+	ticker time.Ticker
+	tick func()
+
+	electionElapsed  int
+	heartbeatElapsed int
+
+	electionTimeout  int
+	heartbeatTimeout int
+
+	// channels
+	voteC 		chan RequestVoteArgs
+	voteReplyC 	chan RequestVoteReply
+	appC 		chan AppendEntriesArgs
+	appReplyC	chan AppendEntriesReply
+
+	// handler
 }
 
 // return currentTerm and whether this server
@@ -203,26 +155,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-type Message struct {
-	Type int
-	From int
-	To int
-	Entries []Entry
-	Term int
-
-	// filed for request vote rpc
-	LastLogIndex int
-	LastLogTerm int
-	VoteGranted bool
-}
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Msg Message
+	Term int
+	CandidateID int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -231,7 +173,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Msg Message
+	Term int
+	voteGranted bool
 }
 
 //
@@ -277,11 +220,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // AppendEntries RPC
 type AppendEntriesArgs struct {
-	Msg Message
 }
 
 type AppendEntriesReply struct {
-	Msg Message
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -333,6 +274,33 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) tickElection() {
+	rf.electionElapsed++
+	if rf.electionElapsed == rf.electionTimeout {
+		rf.term++
+		rf.becomeCandidate()
+	}
+}
+
+func (rf *Raft) becomeFollower() {
+	rf.role = FOLLOWER
+	rf.tick = rf.tickElection
+}
+
+func (rf *Raft) becomeCandidate() {
+	rf.role = CANDIDATE
+	rf.tick = rf.tickElection
+}
+
+func (rf *Raft) run() {
+	for {
+		<-rf.ticker.C
+		rf.mu.Lock()
+		rf.tick()
+		rf.mu.Unlock()
+	}
 }
 
 //
