@@ -90,7 +90,13 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	term int
+	votedFor int
+
 	role int
+
+	rl raftLog
+
+	votes map[int]struct{}
 
 	ticker time.Ticker
 	tick func()
@@ -101,13 +107,11 @@ type Raft struct {
 	electionTimeout  int
 	heartbeatTimeout int
 
-	// channels
-	voteC 		chan RequestVoteArgs
-	voteReplyC 	chan RequestVoteReply
-	appC 		chan AppendEntriesArgs
-	appReplyC	chan AppendEntriesReply
-
 	// handler
+	requestVoteHandler func(args *RequestVoteArgs, reply *RequestVoteReply)
+	requestVoteReplyHandler func(reply *RequestVoteReply)
+	appendEntriesHandler func(args *AppendEntriesArgs, reply *AppendEntriesArgs)
+	appendEntriesReplyHandler func(reply *AppendEntriesReply)
 }
 
 // return currentTerm and whether this server
@@ -173,8 +177,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term int
-	voteGranted bool
+	Term        int
+	From		int
+	VoteGranted bool
 }
 
 //
@@ -284,14 +289,68 @@ func (rf *Raft) tickElection() {
 	}
 }
 
+func (rf *Raft) tickHeartbeat() {
+
+}
+
 func (rf *Raft) becomeFollower() {
 	rf.role = FOLLOWER
+	rf.votedFor = NonVote
+
 	rf.tick = rf.tickElection
+
+	rf.requestVoteHandler = rf.RequestVoteFollowerHandler
 }
 
 func (rf *Raft) becomeCandidate() {
 	rf.role = CANDIDATE
+	rf.votedFor = rf.me
+
 	rf.tick = rf.tickElection
+
+	// send request vote rpc
+}
+
+func (rf *Raft) becomeLeader() {
+
+}
+
+/* --------- Request Vote RPC Handler ---------- */
+
+func (rf *Raft) RequestVoteFollowerHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
+	reply.Term = rf.term
+	reply.From = rf.me
+
+	if rf.term > args.Term || (rf.term == args.Term && rf.votedFor != NonVote) ||
+		(args.LastLogTerm < rf.rl.lastTerm || args.LastLogIndex < rf.rl.lastIndex){
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.term = args.Term
+	rf.votedFor = args.CandidateID
+
+	rf.electionTimeout = 0
+
+	reply.VoteGranted = true
+}
+
+func (rf *Raft) RequestVoteCandidateFollower(args *RequestVoteArgs, reply *RequestVoteReply) {
+
+}
+
+/* ---------- Request Vote RPC Reply Handler ---------- */
+
+func (rf *Raft) RequestVoteReplyCandidateHandler(reply *RequestVoteReply) {
+	if reply.Term > rf.term {
+		rf.term = reply.Term
+		rf.becomeFollower()
+	}
+
+	rf.votes[reply.From] = struct{}{}
+	if len(rf.votes) >= (1 + len(rf.peers)/2) {
+		rf.becomeLeader()
+	}
 }
 
 func (rf *Raft) run() {
