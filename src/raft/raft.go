@@ -75,30 +75,70 @@ type RaftStateMachine struct {
 
 	vote int // peer's vote for this term
 
-	// fileds for election timeout
-	// timeout is must between 250 - 500 ms
 	electionTimeout int
 	heartbeatTimeout int
 
-	msgs []Message
+	electionElapsed int
+	heartbeatElapsed int
+
+	tick func()
+	step func(m Message) // step function
+
+	msgs []Message // messages ready to send to other peers
 }
 
 func (rsm *RaftStateMachine) becomeFollower() {
-
+	rsm.role = FOLLOWER
+	rsm.step = rsm.stepFollower
 }
 
 func (rsm *RaftStateMachine) becomeCandidate() {
-
+	rsm.role = CANDIDATE
+	rsm.step = rsm.stepCandidate
 }
 
 func (rsm *RaftStateMachine) becomeLeader() {
+	rsm.role = LEADER
+}
+
+func (rsm *RaftStateMachine) stepFollower(m Message) {
+
+}
+
+func (rsm *RaftStateMachine) stepCandidate(m Message) {
+
+}
+
+func (rsm *RaftStateMachine) stepLeader(m Message) {
 
 }
 
 func (rsm *RaftStateMachine) Step(m Message) {
 	if rsm.term < m.Term {
-
+		rsm.becomeFollower()
 	}
+	rsm.step(m)
+}
+
+func (rsm *RaftStateMachine) tickElection() {
+	rsm.electionElapsed++
+	if rsm.electionElapsed == rsm.electionTimeout {
+		rsm.electionElapsed = 0
+		rsm.term++
+		rsm.becomeCandidate()
+	}
+}
+
+func (rsm *RaftStateMachine) tickHeartbeat() {
+	rsm.heartbeatElapsed++
+	if rsm.heartbeatElapsed == rsm.heartbeatTimeout {
+		rsm.heartbeatElapsed = 0
+		// send heartbeats
+	}
+}
+
+func (rsm *RaftStateMachine) send(msgs []Message) {
+	rsm.msgs = append(rsm.msgs, msgs...)
 }
 
 //
