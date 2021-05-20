@@ -108,10 +108,10 @@ type Raft struct {
 	heartbeatTimeout int
 
 	// handler
-	requestVoteHandler func(args *RequestVoteArgs, reply *RequestVoteReply)
-	requestVoteReplyHandler func(reply *RequestVoteReply)
-	appendEntriesHandler func(args *AppendEntriesArgs, reply *AppendEntriesArgs)
-	appendEntriesReplyHandler func(reply *AppendEntriesReply)
+	handleRequestVote        func(args *RequestVoteArgs, reply *RequestVoteReply)
+	handleRequestVoteReply   func(reply *RequestVoteReply)
+	handleAppendEntries      func(args *AppendEntriesArgs, reply *AppendEntriesReply)
+	handleAppendEntriesReply func(reply *AppendEntriesReply)
 }
 
 // return currentTerm and whether this server
@@ -223,6 +223,14 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	if ok := rf.sendRequestVote(server, args, reply); ok {
+		rf.mu.Lock()
+		rf.handleRequestVoteReply(reply)
+		rf.mu.Unlock()
+	}
+}
+
 // AppendEntries RPC
 type AppendEntriesArgs struct {
 }
@@ -231,12 +239,23 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	rf.handleAppendEntries(args, reply)
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	// DPrintf("node%d send heartbreak to node%d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if ok := rf.sendAppendEntries(server, args, reply); ok {
+		rf.mu.Lock()
+		rf.handleAppendEntriesReply(reply)
+		rf.mu.Unlock()
+	}
 }
 
 //
@@ -281,6 +300,8 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+/* ---------- Tick Function ----------*/
+
 func (rf *Raft) tickElection() {
 	rf.electionElapsed++
 	if rf.electionElapsed == rf.electionTimeout {
@@ -290,16 +311,32 @@ func (rf *Raft) tickElection() {
 }
 
 func (rf *Raft) tickHeartbeat() {
-
+	rf.heartbeatElapsed++
+	if rf.heartbeatElapsed == rf.heartbeatTimeout {
+		rf.heartbeatElapsed = 0
+		// send append entries rpc
+		for i, _ := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			go func(id int) {
+				// todo
+			}(i)
+		}
+	}
 }
+
+/* ---------- Machine State Transition ---------- */
 
 func (rf *Raft) becomeFollower() {
 	rf.role = FOLLOWER
 	rf.votedFor = NonVote
 
 	rf.tick = rf.tickElection
+	rf.electionElapsed = 0
 
-	rf.requestVoteHandler = rf.RequestVoteFollowerHandler
+	rf.handleRequestVote = rf.RequestVoteCommonHandler
+	rf.handleAppendEntries = rf.followerHandleAppendEntries
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -307,20 +344,48 @@ func (rf *Raft) becomeCandidate() {
 	rf.votedFor = rf.me
 
 	rf.tick = rf.tickElection
+	rf.electionElapsed = 0
+
+	rf.handleRequestVoteReply = rf.RequestVoteReplyCandidateHandler
+
+	// clear votes log and vote self
+	rf.votes = make(map[int]struct{})
+	rf.votes[rf.me] = struct{}{}
 
 	// send request vote rpc
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(id int) {
+			args := &RequestVoteArgs{
+				Term:         rf.term,
+				CandidateID:  rf.me,
+				LastLogIndex: rf.rl.lastIndex,
+				LastLogTerm:  rf.rl.lastTerm,
+			}
+
+			reply := &RequestVoteReply{}
+			rf.sendAndHandleRequestVote(id, args, reply)
+		}(i)
+	}
 }
 
 func (rf *Raft) becomeLeader() {
+	rf.role = LEADER
 
+	rf.tick = rf.tickHeartbeat
+	rf.heartbeatElapsed = 0
 }
 
 /* --------- Request Vote RPC Handler ---------- */
 
-func (rf *Raft) RequestVoteFollowerHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
+// TODO: Can the three state use a common handler?
+func (rf *Raft) RequestVoteCommonHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.term
 	reply.From = rf.me
 
+	// TODO: simplify the vote logic
 	if rf.term > args.Term || (rf.term == args.Term && rf.votedFor != NonVote) ||
 		(args.LastLogTerm < rf.rl.lastTerm || args.LastLogIndex < rf.rl.lastIndex){
 		reply.VoteGranted = false
@@ -333,9 +398,11 @@ func (rf *Raft) RequestVoteFollowerHandler(args *RequestVoteArgs, reply *Request
 	rf.electionTimeout = 0
 
 	reply.VoteGranted = true
+
+	rf.becomeFollower()
 }
 
-func (rf *Raft) RequestVoteCandidateFollower(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVoteCandidateHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
@@ -345,6 +412,11 @@ func (rf *Raft) RequestVoteReplyCandidateHandler(reply *RequestVoteReply) {
 	if reply.Term > rf.term {
 		rf.term = reply.Term
 		rf.becomeFollower()
+		return
+	}
+
+	if !reply.VoteGranted{
+		return
 	}
 
 	rf.votes[reply.From] = struct{}{}
@@ -352,6 +424,15 @@ func (rf *Raft) RequestVoteReplyCandidateHandler(reply *RequestVoteReply) {
 		rf.becomeLeader()
 	}
 }
+
+/* ---------- Append Entries RPC Handler ---------- */
+
+func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.electionElapsed = 0
+}
+
+/* ---------- Append Entries Reply RPC Handler ---------- */
+
 
 func (rf *Raft) run() {
 	for {
