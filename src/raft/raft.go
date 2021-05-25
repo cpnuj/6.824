@@ -240,9 +240,11 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 
 // AppendEntries RPC
 type AppendEntriesArgs struct {
+	Term int
 }
 
 type AppendEntriesReply struct {
+	Term int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -328,7 +330,9 @@ func (rf *Raft) tickHeartbeat() {
 			}
 			go func(id int) {
 				// todo
-				args := &AppendEntriesArgs{}
+				args := &AppendEntriesArgs{
+					Term: rf.term,
+				}
 				reply := &AppendEntriesReply{}
 				rf.sendAndHandleAppendEntries(id, args, reply)
 			}(i)
@@ -339,6 +343,7 @@ func (rf *Raft) tickHeartbeat() {
 /* ---------- Machine State Transition ---------- */
 
 func (rf *Raft) becomeFollower() {
+	DPrintf("node %d become follower in term %d\n", rf.me, rf.term)
 	rf.role = FOLLOWER
 	rf.votedFor = NonVote
 
@@ -350,6 +355,7 @@ func (rf *Raft) becomeFollower() {
 }
 
 func (rf *Raft) becomeCandidate() {
+	DPrintf("node %d become candidate in term %d\n", rf.me, rf.term)
 	rf.role = CANDIDATE
 	rf.votedFor = rf.me
 
@@ -357,6 +363,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.electionElapsed = 0
 
 	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
+	rf.handleAppendEntries    = rf.candidateHandleAppendEntries
 
 	// clear votes log and vote self
 	rf.votes = make(map[int]struct{})
@@ -382,11 +389,13 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) becomeLeader() {
+	DPrintf("node %d become leader in term %d\n", rf.me, rf.term)
 	rf.role = LEADER
 
 	rf.tick = rf.tickHeartbeat
 	rf.heartbeatElapsed = 0
 
+	rf.handleAppendEntries      = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 }
 
@@ -398,18 +407,25 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 	reply.From = rf.me
 
 	// TODO: simplify the vote logic
-	if rf.term > args.Term || (rf.term == args.Term && rf.votedFor != NonVote) ||
-		(args.LastLogTerm < rf.rl.lastTerm || args.LastLogIndex < rf.rl.lastIndex){
+	if rf.term > args.Term {
 		reply.VoteGranted = false
 		return
 	}
 
-	rf.term = args.Term
-	rf.votedFor = args.CandidateID
+	if rf.term < args.Term {
+		// Candidate's term is greater than node
+		rf.term = args.Term
+		rf.becomeFollower()
+	}
 
-	reply.VoteGranted = true
-
-	rf.becomeFollower()
+	if rf.votedFor == NonVote && args.LastLogIndex >= rf.rl.lastIndex &&
+		args.LastLogTerm >= rf.rl.lastTerm {
+		rf.votedFor = args.CandidateID
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+	return
 }
 
 func (rf *Raft) RequestVoteCandidateHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -438,9 +454,41 @@ func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 /* ---------- Append Entries RPC Handler ---------- */
 
 func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.term > args.Term {
+		reply.Term = rf.term
+		return
+	}
+
 	rf.electionElapsed = 0
+
+	if rf.term < args.Term {
+		rf.term = args.Term
+	}
 }
 
+func (rf *Raft) candidateHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.term > args.Term {
+		reply.Term = rf.term
+		return
+	}
+
+	if rf.term < args.Term {
+		rf.term = args.Term
+		rf.becomeFollower()
+	}
+}
+
+func (rf *Raft) leaderHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.term > args.Term {
+		reply.Term = rf.term
+		return
+	}
+
+	if rf.term < args.Term {
+		rf.term = args.Term
+		rf.becomeFollower()
+	}
+}
 /* ---------- Append Entries Reply RPC Handler ---------- */
 
 func (rf *Raft) leaderHandleAppendEntriesReply(reply *AppendEntriesReply) {
@@ -477,8 +525,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.ticker = time.NewTicker(time.Millisecond)
-	rf.heartbeatTimeout = 5
-	rf.electionTimeout = 5 + rand.Intn(10)
+	rf.heartbeatTimeout = 100
+	rf.electionTimeout = 100 + rand.Intn(200)
 
 	rf.becomeFollower()
 	go rf.run()
