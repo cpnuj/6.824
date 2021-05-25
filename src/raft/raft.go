@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,7 +99,7 @@ type Raft struct {
 
 	votes map[int]struct{}
 
-	ticker time.Ticker
+	ticker *time.Ticker
 	tick func()
 
 	electionElapsed  int
@@ -118,7 +119,10 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return 0, false
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term, isLeader := rf.term, rf.role == LEADER
+	return term, isLeader
 }
 
 //
@@ -187,6 +191,9 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	rf.handleRequestVote(args, reply)
+	rf.mu.Unlock()
 }
 
 //
@@ -321,6 +328,9 @@ func (rf *Raft) tickHeartbeat() {
 			}
 			go func(id int) {
 				// todo
+				args := &AppendEntriesArgs{}
+				reply := &AppendEntriesReply{}
+				rf.sendAndHandleAppendEntries(id, args, reply)
 			}(i)
 		}
 	}
@@ -335,7 +345,7 @@ func (rf *Raft) becomeFollower() {
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
 
-	rf.handleRequestVote = rf.RequestVoteCommonHandler
+	rf.handleRequestVote = rf.commonHandleRequestVote
 	rf.handleAppendEntries = rf.followerHandleAppendEntries
 }
 
@@ -346,7 +356,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
 
-	rf.handleRequestVoteReply = rf.RequestVoteReplyCandidateHandler
+	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
 
 	// clear votes log and vote self
 	rf.votes = make(map[int]struct{})
@@ -376,12 +386,14 @@ func (rf *Raft) becomeLeader() {
 
 	rf.tick = rf.tickHeartbeat
 	rf.heartbeatElapsed = 0
+
+	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 }
 
 /* --------- Request Vote RPC Handler ---------- */
 
 // TODO: Can the three state use a common handler?
-func (rf *Raft) RequestVoteCommonHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.term
 	reply.From = rf.me
 
@@ -395,8 +407,6 @@ func (rf *Raft) RequestVoteCommonHandler(args *RequestVoteArgs, reply *RequestVo
 	rf.term = args.Term
 	rf.votedFor = args.CandidateID
 
-	rf.electionTimeout = 0
-
 	reply.VoteGranted = true
 
 	rf.becomeFollower()
@@ -408,7 +418,7 @@ func (rf *Raft) RequestVoteCandidateHandler(args *RequestVoteArgs, reply *Reques
 
 /* ---------- Request Vote RPC Reply Handler ---------- */
 
-func (rf *Raft) RequestVoteReplyCandidateHandler(reply *RequestVoteReply) {
+func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 	if reply.Term > rf.term {
 		rf.term = reply.Term
 		rf.becomeFollower()
@@ -433,6 +443,9 @@ func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *Appe
 
 /* ---------- Append Entries Reply RPC Handler ---------- */
 
+func (rf *Raft) leaderHandleAppendEntriesReply(reply *AppendEntriesReply) {
+
+}
 
 func (rf *Raft) run() {
 	for {
@@ -463,6 +476,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.ticker = time.NewTicker(time.Millisecond)
+	rf.heartbeatTimeout = 5
+	rf.electionTimeout = 5 + rand.Intn(10)
+
+	rf.becomeFollower()
+	go rf.run()
 
 	return rf
 }
