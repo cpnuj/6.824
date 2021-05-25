@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/fmtsafe/testdata/src/github.com/cockroachdb/errors"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -32,7 +34,7 @@ import "../labrpc"
 // import "bytes"
 // import "../labgob"
 
-//
+// ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -70,10 +72,44 @@ const (
 const NonVote = -1
 
 type raftLog struct {
-	lastIndex int
-	lastTerm int
-	commit int
-	entries []Entry
+	lastIndex   int
+	lastTerm    int
+	commitIndex int
+	entries     []Entry
+}
+
+func (rl *raftLog) Append(ent Entry) error {
+	if ent.Term < rl.lastTerm {
+		return errors.New("receive append entry with less term")
+	}
+	rl.entries = append(rl.entries, ent)
+	rl.lastTerm = ent.Term
+	rl.lastIndex++
+	return nil
+}
+
+func newRaftLog() *raftLog {
+	rl := &raftLog{}
+	rl.lastIndex = 0
+	rl.lastTerm = 0
+	rl.commitIndex = 0
+	rl.entries = make([]Entry, 1)
+	rl.entries[0] = Entry{struct {}{}, 0}
+	return rl
+}
+
+/* ---------- Progress Tracker For Leader ---------- */
+
+type progressTracker struct {
+	matchIndex []int
+	nextIndex []int
+}
+
+func newProgressTracker(n int) *progressTracker {
+	pt := &progressTracker{}
+	pt.matchIndex = make([]int, n)
+	pt.nextIndex = make([]int, n)
+	return pt
 }
 
 //
@@ -95,7 +131,9 @@ type Raft struct {
 
 	role int
 
-	rl raftLog
+	rl *raftLog
+
+	pt *progressTracker
 
 	votes map[int]struct{}
 
@@ -241,10 +279,15 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 // AppendEntries RPC
 type AppendEntriesArgs struct {
 	Term int
+	PrevLogIndex int
+	PrevLogTerm int
+	CommitIndex int
+	Entries []Entry
 }
 
 type AppendEntriesReply struct {
 	Term int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -260,6 +303,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	mi := rf.pt.matchIndex[server]
+	ent := rf.rl.entries[mi+1]
 	if ok := rf.sendAppendEntries(server, args, reply); ok {
 		rf.mu.Lock()
 		rf.handleAppendEntriesReply(reply)
@@ -267,7 +312,7 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	}
 }
 
-//
+// Start
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -283,7 +328,13 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != LEADER {
+		return 0, 0, false
+	} else {
+		rf.propose(command)
+	}
 	return 0, 0, false
 }
 
@@ -397,6 +448,10 @@ func (rf *Raft) becomeLeader() {
 
 	rf.handleAppendEntries      = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
+
+	// reinitialize progress tracker
+	rf.pt = newProgressTracker(len(rf.peers))
+	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
 }
 
 /* --------- Request Vote RPC Handler ---------- */
@@ -495,6 +550,16 @@ func (rf *Raft) leaderHandleAppendEntriesReply(reply *AppendEntriesReply) {
 
 }
 
+/* ---------- Propose Command to Leader ---------- */
+
+func (rf *Raft) propose(command interface{}) {
+	ent := Entry{command, rf.term}
+	if err := rf.rl.Append(ent); err != nil {
+		log.Printf("node %d append entry error: ", rf.me)
+		panic(err)
+	}
+}
+
 func (rf *Raft) run() {
 	for {
 		<-rf.ticker.C
@@ -527,6 +592,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ticker = time.NewTicker(time.Millisecond)
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 100 + rand.Intn(200)
+
+	rf.rl = newRaftLog()
 
 	rf.becomeFollower()
 	go rf.run()
