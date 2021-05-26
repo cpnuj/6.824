@@ -147,6 +147,7 @@ type Raft struct {
 	pt *progressTracker
 
 	applyCh chan ApplyMsg
+	done chan struct{}
 
 	votes map[int]struct{}
 
@@ -385,6 +386,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	// DPrintf("node%d has been killed.\n", rf.me)
+	rf.done <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
@@ -434,6 +436,7 @@ func (rf *Raft) becomeFollower() {
 	rf.electionElapsed = 0
 
 	rf.handleRequestVote = rf.commonHandleRequestVote
+	rf.handleRequestVoteReply = rf.emptyHandleRequestVoteReply
 	rf.handleAppendEntries = rf.followerHandleAppendEntries
 }
 
@@ -445,6 +448,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
 
+	rf.handleRequestVote = rf.commonHandleRequestVote
 	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
 	rf.handleAppendEntries = rf.candidateHandleAppendEntries
 
@@ -478,6 +482,7 @@ func (rf *Raft) becomeLeader() {
 	rf.tick = rf.tickHeartbeat
 	rf.heartbeatElapsed = 0
 
+	rf.handleRequestVoteReply = rf.emptyHandleRequestVoteReply
 	rf.handleAppendEntries = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
@@ -493,6 +498,7 @@ func (rf *Raft) becomeLeader() {
 /* --------- Request Vote RPC Handler ---------- */
 
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("%d receive request vote %v\n", rf.me, args)
 	reply.Term = rf.term
 	reply.From = rf.me
 
@@ -506,17 +512,29 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 		rf.becomeFollower()
 	}
 
-	if rf.votedFor == NonVote && args.LastLogIndex >= rf.rl.lastIndex &&
-		args.LastLogTerm >= rf.rl.lastTerm {
-		rf.votedFor = args.CandidateID
-		reply.VoteGranted = true
-	} else {
+	if rf.votedFor != NonVote {
 		reply.VoteGranted = false
+		return
 	}
+	if args.LastLogTerm < rf.rl.lastTerm {
+		reply.VoteGranted = false
+		return
+	}
+	if args.LastLogTerm == rf.rl.lastTerm {
+		if args.LastLogIndex < rf.rl.lastIndex {
+			reply.VoteGranted = false
+			return
+		}
+	}
+	reply.VoteGranted = true
 	return
 }
 
 /* ---------- Request Vote RPC Reply Handler ---------- */
+
+func (rf *Raft) emptyHandleRequestVoteReply(reply *RequestVoteReply) {
+
+}
 
 func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 	if reply.Term > rf.term {
@@ -691,11 +709,17 @@ func (rf *Raft) propose(command interface{}) {
 }
 
 func (rf *Raft) run() {
+	rf.ticker = time.NewTicker(time.Millisecond)
+	defer rf.ticker.Stop()
 	for {
-		<-rf.ticker.C
-		rf.mu.Lock()
-		rf.tick()
-		rf.mu.Unlock()
+		select {
+		case <-rf.ticker.C:
+			rf.mu.Lock()
+			rf.tick()
+			rf.mu.Unlock()
+		case <-rf.done:
+			return
+		}
 	}
 }
 
@@ -717,11 +741,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.done = make(chan struct{})
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.ticker = time.NewTicker(time.Millisecond)
 	rf.heartbeatTimeout = 100
-	rf.electionTimeout = 100 + rand.Intn(200)
+	rf.electionTimeout = 150 + rand.Intn(200)
 
 	rf.applyCh = applyCh
 
