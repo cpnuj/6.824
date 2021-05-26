@@ -88,6 +88,30 @@ func (rl *raftLog) Append(ent Entry) error {
 	return nil
 }
 
+func (rl *raftLog) CommitTo(ci int) bool {
+	if ci < rl.commitIndex {
+		log.Printf("try to commit to a smaller index\n")
+		return false
+	}
+	rl.commitIndex = ci
+	return true
+}
+
+func (rl *raftLog) Visit(begin, end int, fn func(Entry)) {
+	for i := begin; i <= end; i++ {
+		fn(rl.entries[i])
+	}
+}
+
+func (rl *raftLog) Match(index, term int) bool {
+	if rl.lastIndex < index ||
+		rl.entries[index].Term != term {
+		return false
+	} else {
+		return true
+	}
+}
+
 func newRaftLog() *raftLog {
 	rl := &raftLog{}
 	rl.lastIndex = 0
@@ -150,7 +174,7 @@ type Raft struct {
 	handleRequestVote        func(args *RequestVoteArgs, reply *RequestVoteReply)
 	handleRequestVoteReply   func(reply *RequestVoteReply)
 	handleAppendEntries      func(args *AppendEntriesArgs, reply *AppendEntriesReply)
-	handleAppendEntriesReply func(reply *AppendEntriesReply)
+	handleAppendEntriesReply func(args *AppendEntriesArgs, reply *AppendEntriesReply)
 }
 
 // return currentTerm and whether this server
@@ -279,6 +303,7 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 // AppendEntries RPC
 type AppendEntriesArgs struct {
 	Term int
+	From int
 	PrevLogIndex int
 	PrevLogTerm int
 	CommitIndex int
@@ -287,6 +312,7 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	Term int
+	From int
 	Success bool
 }
 
@@ -303,11 +329,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	mi := rf.pt.matchIndex[server]
-	ent := rf.rl.entries[mi+1]
+	rf.mu.Lock()
+	ni := rf.pt.nextIndex[server]
+	prevLogIndex := ni - 1
+	prevLogTerm := rf.rl.entries[prevLogIndex].Term
+	ent := rf.rl.entries[ni]
+	rf.mu.Unlock()
+
+	args.PrevLogIndex = prevLogIndex
+	args.PrevLogTerm = prevLogTerm
+	args.Entries = []Entry{ent}
+
 	if ok := rf.sendAppendEntries(server, args, reply); ok {
 		rf.mu.Lock()
-		rf.handleAppendEntriesReply(reply)
+		rf.handleAppendEntriesReply(args, reply)
 		rf.mu.Unlock()
 	}
 }
@@ -380,9 +415,9 @@ func (rf *Raft) tickHeartbeat() {
 				continue
 			}
 			go func(id int) {
-				// todo
 				args := &AppendEntriesArgs{
 					Term: rf.term,
+					From: rf.me,
 				}
 				reply := &AppendEntriesReply{}
 				rf.sendAndHandleAppendEntries(id, args, reply)
@@ -449,26 +484,27 @@ func (rf *Raft) becomeLeader() {
 	rf.handleAppendEntries      = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
-	// reinitialize progress tracker
+	// reset progress tracker
 	rf.pt = newProgressTracker(len(rf.peers))
 	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
+	// try to replicate from the last index
+	for id, _ := range rf.pt.nextIndex {
+		rf.pt.nextIndex[id] = rf.rl.lastIndex
+	}
 }
 
 /* --------- Request Vote RPC Handler ---------- */
 
-// TODO: Can the three state use a common handler?
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.term
 	reply.From = rf.me
 
-	// TODO: simplify the vote logic
 	if rf.term > args.Term {
 		reply.VoteGranted = false
 		return
 	}
 
 	if rf.term < args.Term {
-		// Candidate's term is greater than node
 		rf.term = args.Term
 		rf.becomeFollower()
 	}
@@ -481,10 +517,6 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 		reply.VoteGranted = false
 	}
 	return
-}
-
-func (rf *Raft) RequestVoteCandidateHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
-
 }
 
 /* ---------- Request Vote RPC Reply Handler ---------- */
@@ -508,9 +540,27 @@ func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 
 /* ---------- Append Entries RPC Handler ---------- */
 
+func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) == false {
+		reply.Success = false
+		return
+	}
+
+	bi := args.PrevLogIndex + 1
+	rf.rl.entries = rf.rl.entries[:bi]
+	rf.rl.entries = append(rf.rl.entries, args.Entries...)
+	reply.Success = true
+
+	// TODO deal with commit index
+	return
+}
+
 func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.From = rf.me
+	reply.Term = rf.term
+
 	if rf.term > args.Term {
-		reply.Term = rf.term
+		reply.Success = false
 		return
 	}
 
@@ -518,36 +568,80 @@ func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *Appe
 
 	if rf.term < args.Term {
 		rf.term = args.Term
+		rf.votedFor = args.From
 	}
+
+	rf.tryAppendEntries(args, reply)
 }
 
+// TODO: candidate and leader share the same logic, modify it
 func (rf *Raft) candidateHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.From = rf.me
+	reply.Term = rf.term
+
 	if rf.term > args.Term {
-		reply.Term = rf.term
+		reply.Success = false
 		return
 	}
 
-	if rf.term < args.Term {
+	if rf.term <= args.Term {
 		rf.term = args.Term
 		rf.becomeFollower()
+		rf.votedFor = args.From
 	}
+
+	rf.tryAppendEntries(args, reply)
 }
 
 func (rf *Raft) leaderHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.From = rf.me
+	reply.Term = rf.term
+
 	if rf.term > args.Term {
-		reply.Term = rf.term
+		reply.Success = false
 		return
 	}
 
-	if rf.term < args.Term {
+	if rf.term <= args.Term {
 		rf.term = args.Term
 		rf.becomeFollower()
+		rf.votedFor = args.From
 	}
+
+	rf.tryAppendEntries(args, reply)
 }
 /* ---------- Append Entries Reply RPC Handler ---------- */
 
-func (rf *Raft) leaderHandleAppendEntriesReply(reply *AppendEntriesReply) {
+func insertionSort(sl []int) {
+	a, b := 0, len(sl)
+	for i := a + 1; i < b; i++ {
+		for j := i; j > a && sl[j] < sl[j-1]; j-- {
+			sl[j], sl[j-1] = sl[j-1], sl[j]
+		}
+	}
+}
 
+func (rf *Raft) tryCommit() {
+	n, sl := len(rf.peers), make([]int, n)
+	copy(sl, rf.pt.matchIndex)
+	insertionSort(sl)
+
+	pos := n/2 - 1
+	oldci, newci := rf.rl.commitIndex, sl[pos]
+	if ok := rf.rl.CommitTo(newci); ok {
+
+	}
+}
+
+func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	from := reply.From
+	if reply.Success {
+		rf.pt.matchIndex[from] = rf.pt.nextIndex[from] + len(args.Entries) - 1
+		rf.pt.nextIndex[from] = rf.pt.matchIndex[from] + 1
+
+	} else {
+
+	}
 }
 
 /* ---------- Propose Command to Leader ---------- */
