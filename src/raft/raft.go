@@ -656,7 +656,7 @@ func (rf *Raft) tryCommit() {
 	copy(sl, rf.pt.matchIndex)
 	insertionSort(sl)
 
-	pos := n/2 - 1
+	pos := n - (n/2 + 1)
 	oldci, newci := rf.rl.commitIndex, sl[pos]
 	if ok := rf.rl.CommitTo(newci); ok {
 		rf.apply(oldci+1, newci)
