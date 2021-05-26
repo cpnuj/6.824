@@ -97,12 +97,6 @@ func (rl *raftLog) CommitTo(ci int) bool {
 	return true
 }
 
-func (rl *raftLog) Visit(begin, end int, fn func(Entry)) {
-	for i := begin; i <= end; i++ {
-		fn(rl.entries[i])
-	}
-}
-
 func (rl *raftLog) Match(index, term int) bool {
 	if rl.lastIndex < index ||
 		rl.entries[index].Term != term {
@@ -158,6 +152,8 @@ type Raft struct {
 	rl *raftLog
 
 	pt *progressTracker
+
+	applyCh chan ApplyMsg
 
 	votes map[int]struct{}
 
@@ -323,7 +319,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// DPrintf("node%d send heartbreak to node%d", rf.me, server)
+	if len(args.Entries) > 0 {
+		// DPrintf("%d send heartbreak to %d with entry %v", rf.me, server, args.Entries)
+	}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -333,12 +331,17 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	ni := rf.pt.nextIndex[server]
 	prevLogIndex := ni - 1
 	prevLogTerm := rf.rl.entries[prevLogIndex].Term
-	ent := rf.rl.entries[ni]
+	commitIndex := rf.rl.commitIndex
+	ents := make([]Entry, 0)
+	if ni <= rf.rl.lastIndex {
+		ents = append(ents, rf.rl.entries[ni])
+	}
 	rf.mu.Unlock()
 
 	args.PrevLogIndex = prevLogIndex
 	args.PrevLogTerm = prevLogTerm
-	args.Entries = []Entry{ent}
+	args.CommitIndex = commitIndex
+	args.Entries = ents
 
 	if ok := rf.sendAppendEntries(server, args, reply); ok {
 		rf.mu.Lock()
@@ -368,9 +371,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != LEADER {
 		return 0, 0, false
 	} else {
+		index, term := rf.rl.lastIndex+1, rf.rl.lastTerm
 		rf.propose(command)
+		return index, term, true
 	}
-	return 0, 0, false
 }
 
 //
@@ -489,7 +493,7 @@ func (rf *Raft) becomeLeader() {
 	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
 	// try to replicate from the last index
 	for id, _ := range rf.pt.nextIndex {
-		rf.pt.nextIndex[id] = rf.rl.lastIndex
+		rf.pt.nextIndex[id] = rf.rl.lastIndex+1
 	}
 }
 
@@ -547,11 +551,22 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	}
 
 	bi := args.PrevLogIndex + 1
+	// TODO: run these logic inside struct raftLog
 	rf.rl.entries = rf.rl.entries[:bi]
 	rf.rl.entries = append(rf.rl.entries, args.Entries...)
+	rf.rl.lastIndex = bi + len(args.Entries) - 1
+	rf.rl.lastTerm = rf.rl.entries[rf.rl.lastIndex].Term
 	reply.Success = true
 
-	// TODO deal with commit index
+	if args.CommitIndex > rf.rl.commitIndex {
+		oldci, newci := rf.rl.commitIndex, args.CommitIndex
+		if newci > rf.rl.lastIndex {
+			newci = rf.rl.lastIndex
+		}
+		if ok := rf.rl.CommitTo(newci); ok {
+			rf.apply(oldci+1, newci)
+		}
+	}
 	return
 }
 
@@ -621,26 +636,52 @@ func insertionSort(sl []int) {
 	}
 }
 
+func (rf *Raft) apply(begin, end int) {
+	if end > rf.rl.lastIndex {
+		panic("apply index greater than last index")
+	}
+	for i := begin; i <= end; i++ {
+		am := ApplyMsg{
+			CommandValid: true,
+			Command: rf.rl.entries[i].Command,
+			CommandIndex: i,
+		}
+		rf.applyCh <- am
+	}
+}
+
 func (rf *Raft) tryCommit() {
-	n, sl := len(rf.peers), make([]int, n)
+	n := len(rf.peers)
+	sl := make([]int, n)
 	copy(sl, rf.pt.matchIndex)
 	insertionSort(sl)
 
 	pos := n/2 - 1
 	oldci, newci := rf.rl.commitIndex, sl[pos]
 	if ok := rf.rl.CommitTo(newci); ok {
-
+		rf.apply(oldci+1, newci)
 	}
 }
 
 func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	from := reply.From
+
+	if reply.Term > rf.term {
+		rf.term = reply.Term
+		rf.becomeFollower()
+		return
+	}
+
+	if len(args.Entries) == 0 {
+		return
+	}
+
 	if reply.Success {
 		rf.pt.matchIndex[from] = rf.pt.nextIndex[from] + len(args.Entries) - 1
 		rf.pt.nextIndex[from] = rf.pt.matchIndex[from] + 1
-
+		rf.tryCommit()
 	} else {
-
+		rf.pt.nextIndex[from] -= 1
 	}
 }
 
@@ -652,6 +693,7 @@ func (rf *Raft) propose(command interface{}) {
 		log.Printf("node %d append entry error: ", rf.me)
 		panic(err)
 	}
+	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
 }
 
 func (rf *Raft) run() {
@@ -686,6 +728,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ticker = time.NewTicker(time.Millisecond)
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 100 + rand.Intn(200)
+
+	rf.applyCh = applyCh
 
 	rf.rl = newRaftLog()
 
