@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"../labrpc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/fmtsafe/testdata/src/github.com/cockroachdb/errors"
 	"log"
 	"math/rand"
@@ -25,14 +26,6 @@ import (
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
 //
-
-// import "fmt"
-// import "time"
-// import "sync/atomic"
-import "../labrpc"
-
-// import "bytes"
-// import "../labgob"
 
 // ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
@@ -112,7 +105,7 @@ func newRaftLog() *raftLog {
 	rl.lastTerm = 0
 	rl.commitIndex = 0
 	rl.entries = make([]Entry, 1)
-	rl.entries[0] = Entry{struct {}{}, 0}
+	rl.entries[0] = Entry{struct{}{}, 0}
 	return rl
 }
 
@@ -120,7 +113,7 @@ func newRaftLog() *raftLog {
 
 type progressTracker struct {
 	matchIndex []int
-	nextIndex []int
+	nextIndex  []int
 }
 
 func newProgressTracker(n int) *progressTracker {
@@ -144,7 +137,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	term int
+	term     int
 	votedFor int
 
 	role int
@@ -158,7 +151,7 @@ type Raft struct {
 	votes map[int]struct{}
 
 	ticker *time.Ticker
-	tick func()
+	tick   func()
 
 	electionElapsed  int
 	heartbeatElapsed int
@@ -173,7 +166,7 @@ type Raft struct {
 	handleAppendEntriesReply func(args *AppendEntriesArgs, reply *AppendEntriesReply)
 }
 
-// return currentTerm and whether this server
+// GetState return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
@@ -221,30 +214,30 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-//
+// RequestVoteArgs
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int
-	CandidateID int
+	Term         int
+	CandidateID  int
 	LastLogIndex int
-	LastLogTerm int
+	LastLogTerm  int
 }
 
-//
+// RequestVoteReply
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
-	From		int
+	From        int
 	VoteGranted bool
 }
 
-//
+// RequestVote
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -298,17 +291,17 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 
 // AppendEntries RPC
 type AppendEntriesArgs struct {
-	Term int
-	From int
+	Term         int
+	From         int
 	PrevLogIndex int
-	PrevLogTerm int
-	CommitIndex int
-	Entries []Entry
+	PrevLogTerm  int
+	CommitIndex  int
+	Entries      []Entry
 }
 
 type AppendEntriesReply struct {
-	Term int
-	From int
+	Term    int
+	From    int
 	Success bool
 }
 
@@ -377,7 +370,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 }
 
-//
+// Kill
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -453,7 +446,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.electionElapsed = 0
 
 	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
-	rf.handleAppendEntries    = rf.candidateHandleAppendEntries
+	rf.handleAppendEntries = rf.candidateHandleAppendEntries
 
 	// clear votes log and vote self
 	rf.votes = make(map[int]struct{})
@@ -485,7 +478,7 @@ func (rf *Raft) becomeLeader() {
 	rf.tick = rf.tickHeartbeat
 	rf.heartbeatElapsed = 0
 
-	rf.handleAppendEntries      = rf.leaderHandleAppendEntries
+	rf.handleAppendEntries = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
 	// reset progress tracker
@@ -493,7 +486,7 @@ func (rf *Raft) becomeLeader() {
 	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
 	// try to replicate from the last index
 	for id, _ := range rf.pt.nextIndex {
-		rf.pt.nextIndex[id] = rf.rl.lastIndex+1
+		rf.pt.nextIndex[id] = rf.rl.lastIndex + 1
 	}
 }
 
@@ -532,7 +525,7 @@ func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 		return
 	}
 
-	if !reply.VoteGranted{
+	if !reply.VoteGranted {
 		return
 	}
 
@@ -625,6 +618,7 @@ func (rf *Raft) leaderHandleAppendEntries(args *AppendEntriesArgs, reply *Append
 
 	rf.tryAppendEntries(args, reply)
 }
+
 /* ---------- Append Entries Reply RPC Handler ---------- */
 
 func insertionSort(sl []int) {
@@ -643,7 +637,7 @@ func (rf *Raft) apply(begin, end int) {
 	for i := begin; i <= end; i++ {
 		am := ApplyMsg{
 			CommandValid: true,
-			Command: rf.rl.entries[i].Command,
+			Command:      rf.rl.entries[i].Command,
 			CommandIndex: i,
 		}
 		rf.applyCh <- am
