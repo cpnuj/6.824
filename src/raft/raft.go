@@ -442,7 +442,7 @@ func (rf *Raft) tickHeartbeat() {
 // Machine state transition
 //
 func (rf *Raft) becomeFollower() {
-	DPrintf("node %d become follower in term %d\n", rf.me, rf.term)
+	DPrintf("[debug node] %d become follower in term %d\n", rf.me, rf.term)
 	rf.role = FOLLOWER
 	rf.votedFor = NonVote
 
@@ -455,7 +455,7 @@ func (rf *Raft) becomeFollower() {
 }
 
 func (rf *Raft) becomeCandidate() {
-	DPrintf("node %d become candidate in term %d\n", rf.me, rf.term)
+	DPrintf("[debug node] %d become candidate in term %d\n", rf.me, rf.term)
 	rf.role = CANDIDATE
 	rf.votedFor = rf.me
 
@@ -505,7 +505,7 @@ func (rf *Raft) resetProgressTracker() {
 }
 
 func (rf *Raft) becomeLeader() {
-	DPrintf("node %d become leader in term %d\n", rf.me, rf.term)
+	DPrintf("[debug node] %d become leader in term %d\n", rf.me, rf.term)
 	rf.role = LEADER
 
 	rf.tick = rf.tickHeartbeat
@@ -516,6 +516,21 @@ func (rf *Raft) becomeLeader() {
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
 	rf.resetProgressTracker()
+
+	// send append entries rpc
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(id int) {
+			args := &AppendEntriesArgs{
+				Term: rf.term,
+				From: rf.me,
+			}
+			reply := &AppendEntriesReply{}
+			rf.sendAndHandleAppendEntries(id, args, reply)
+		}(i)
+	}
 }
 
 //
@@ -737,7 +752,6 @@ func (rf *Raft) propose(command interface{}) {
 	ent := Entry{command, rf.term}
 	rf.rl.Append([]Entry{ent})
 	rf.pt[rf.me].match = rf.rl.lastIndex
-	DPrintf("[debug propose] %d append 1 entry lastIndex %d lastTerm %d\n", rf.me, rf.rl.lastIndex, rf.rl.lastTerm)
 }
 
 func (rf *Raft) run() {
