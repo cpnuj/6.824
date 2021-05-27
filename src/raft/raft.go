@@ -73,16 +73,18 @@ func (rl *raftLog) Append(ent Entry) error {
 		return errors.New("receive append entry with old term")
 	}
 	rl.entries = append(rl.entries, ent)
-	rl.lastTerm = ent.Term
 	rl.lastIndex++
+	rl.lastTerm = rl.entries[rl.lastIndex].Term
 	return nil
 }
 
-func (rl *raftLog) DeleteFrom(begin int) error {
-	if begin <= 0 {
+func (rl *raftLog) DeleteFrom(from int) error {
+	if from <= 0 {
 		return errors.New("delete from invalid index")
 	}
-	rl.entries = rl.entries[:begin]
+	rl.entries = rl.entries[:from]
+	rl.lastIndex = from - 1
+	rl.lastTerm = rl.entries[rl.lastIndex].Term
 	return nil
 }
 
@@ -113,9 +115,20 @@ func newRaftLog() *raftLog {
 	return rl
 }
 
+//
+// A progress struct represent a peer's progress of log replication
+// from the leader's view
+//
 type progress struct {
 	match int
-	next int
+	next  int
+}
+
+type progressTracker []progress
+
+func makeProgressTracker(n int) progressTracker {
+	pt := make(progressTracker, n)
+	return pt
 }
 
 //
@@ -320,9 +333,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	if len(args.Entries) > 0 {
-		// DPrintf("%d send heartbreak to %d with entry %v", rf.me, server, args.Entries)
-	}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -401,8 +411,9 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-/* ---------- Tick Function ----------*/
-
+//
+// tick functions
+//
 func (rf *Raft) tickElection() {
 	rf.electionElapsed++
 	if rf.electionElapsed == rf.electionTimeout {
@@ -432,8 +443,9 @@ func (rf *Raft) tickHeartbeat() {
 	}
 }
 
-/* ---------- Machine State Transition ---------- */
-
+//
+// Machine state transition
+//
 func (rf *Raft) becomeFollower() {
 	DPrintf("node %d become follower in term %d\n", rf.me, rf.term)
 	rf.role = FOLLOWER
@@ -502,10 +514,10 @@ func (rf *Raft) becomeLeader() {
 	}
 }
 
-/* --------- Request Vote RPC Handler ---------- */
-
+//
+// Request Vote RPC handler
+//
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("%d receive request vote %v\n", rf.me, args)
 	reply.Term = rf.term
 	reply.From = rf.me
 
@@ -537,10 +549,11 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 	return
 }
 
-/* ---------- Request Vote RPC Reply Handler ---------- */
-
+//
+// Request Vote RPC Reply Handler
+//
 func (rf *Raft) emptyHandleRequestVoteReply(reply *RequestVoteReply) {
-
+	// do nothing
 }
 
 func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
@@ -560,8 +573,9 @@ func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 	}
 }
 
-/* ---------- Append Entries RPC Handler ---------- */
-
+//
+// Append Entries RPC Handler
+//
 func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) == false {
 		reply.Success = false
