@@ -68,14 +68,10 @@ type raftLog struct {
 	entries     []Entry
 }
 
-func (rl *raftLog) Append(ent Entry) error {
-	if ent.Term < rl.lastTerm {
-		return errors.New("receive append entry with old term")
-	}
-	rl.entries = append(rl.entries, ent)
-	rl.lastIndex++
+func (rl *raftLog) Append(ents []Entry) {
+	rl.entries = append(rl.entries, ents...)
+	rl.lastIndex += len(ents)
 	rl.lastTerm = rl.entries[rl.lastIndex].Term
-	return nil
 }
 
 func (rl *raftLog) DeleteFrom(from int) error {
@@ -105,6 +101,18 @@ func (rl *raftLog) Match(index, term int) bool {
 	return true
 }
 
+// take the copy of n entries from raft log
+func (rl *raftLog) Take(begin, n int) []Entry {
+	end := begin + n
+	if end > rl.lastIndex + 1 {
+		end = rl.lastIndex + 1
+	}
+	n = end - begin
+	ent := make([]Entry, n)
+	copy(ent, rl.entries[begin:end])
+	return ent
+}
+
 func newRaftLog() *raftLog {
 	rl := &raftLog{}
 	rl.lastIndex = 0
@@ -124,25 +132,13 @@ type progress struct {
 	next  int
 }
 
-type progressTracker []progress
-
-func makeProgressTracker(n int) progressTracker {
-	pt := make(progressTracker, n)
-	return pt
-}
-
 //
 // progress tracker for leader to trace the progress of log replication
 //
-type progressTracer struct {
-	matchIndex []int
-	nextIndex  []int
-}
+type progressTracer []*progress
 
-func newProgressTracer(n int) *progressTracer {
-	pt := &progressTracer{}
-	pt.matchIndex = make([]int, n)
-	pt.nextIndex = make([]int, n)
+func makeProgressTracer(n int) progressTracer {
+	pt := make(progressTracer, n)
 	return pt
 }
 
@@ -165,7 +161,7 @@ type Raft struct {
 	votedFor int
 
 	rl    *raftLog
-	pt    *progressTracer
+	pt    progressTracer
 	votes map[int]struct{}
 
 	applyCh chan ApplyMsg
@@ -339,14 +335,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	ni := rf.pt.nextIndex[server]
+	pt := rf.pt[server]
+	ni := pt.next
 	prevLogIndex := ni - 1
 	prevLogTerm := rf.rl.entries[prevLogIndex].Term
 	commitIndex := rf.rl.commitIndex
-	ents := make([]Entry, 0)
-	if ni <= rf.rl.lastIndex {
-		ents = append(ents, rf.rl.entries[ni])
-	}
+	// TODO: support send more entries
+	ents := rf.rl.Take(ni, 1)
 	rf.mu.Unlock()
 
 	args.PrevLogIndex = prevLogIndex
@@ -494,6 +489,21 @@ func (rf *Raft) becomeCandidate() {
 	}
 }
 
+func (rf *Raft) resetProgressTracker() {
+	pt := makeProgressTracer(len(rf.peers))
+	for i, _ := range pt {
+		if i == rf.me {
+			pt[i] = &progress{match: rf.rl.lastIndex}
+			continue
+		}
+		pt[i] = &progress{
+			match: 0,
+			next:  rf.rl.lastIndex + 1,
+		}
+	}
+	rf.pt = pt
+}
+
 func (rf *Raft) becomeLeader() {
 	DPrintf("node %d become leader in term %d\n", rf.me, rf.term)
 	rf.role = LEADER
@@ -505,19 +515,14 @@ func (rf *Raft) becomeLeader() {
 	rf.handleAppendEntries = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
-	// reset progress tracker
-	rf.pt = newProgressTracer(len(rf.peers))
-	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
-	// try to replicate from the last index
-	for id, _ := range rf.pt.nextIndex {
-		rf.pt.nextIndex[id] = rf.rl.lastIndex + 1
-	}
+	rf.resetProgressTracker()
 }
 
 //
 // Request Vote RPC handler
 //
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("%d receive request vote %v\n", rf.me, args)
 	reply.Term = rf.term
 	reply.From = rf.me
 
@@ -582,12 +587,13 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		return
 	}
 
-	bi := args.PrevLogIndex + 1
 	// TODO: run these logic inside struct raftLog
-	rf.rl.entries = rf.rl.entries[:bi]
-	rf.rl.entries = append(rf.rl.entries, args.Entries...)
-	rf.rl.lastIndex = bi + len(args.Entries) - 1
-	rf.rl.lastTerm = rf.rl.entries[rf.rl.lastIndex].Term
+	bi := args.PrevLogIndex + 1
+	if err := rf.rl.DeleteFrom(bi); err != nil {
+		log.Fatal(err)
+	}
+	rf.rl.Append(args.Entries)
+
 	reply.Success = true
 
 	if args.CommitIndex > rf.rl.commitIndex {
@@ -685,12 +691,14 @@ func (rf *Raft) apply(begin, end int) {
 
 func (rf *Raft) tryCommit() {
 	n := len(rf.peers)
-	sl := make([]int, n)
-	copy(sl, rf.pt.matchIndex)
-	insertionSort(sl)
+	arr := make([]int, n)
+	for i, pt := range rf.pt {
+		arr[i] = pt.match
+	}
+	insertionSort(arr)
 
 	pos := n - (n/2 + 1)
-	oldci, newci := rf.rl.commitIndex, sl[pos]
+	oldci, newci := rf.rl.commitIndex, arr[pos]
 	if ok := rf.rl.CommitTo(newci); ok {
 		rf.apply(oldci+1, newci)
 	}
@@ -709,12 +717,13 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 		return
 	}
 
+	pg := rf.pt[from]
 	if reply.Success {
-		rf.pt.matchIndex[from] = rf.pt.nextIndex[from] + len(args.Entries) - 1
-		rf.pt.nextIndex[from] = rf.pt.matchIndex[from] + 1
+		pg.match = pg.next + len(args.Entries) - 1
+		pg.next = pg.match + 1
 		rf.tryCommit()
 	} else {
-		rf.pt.nextIndex[from] -= 1
+		pg.next -= 1
 	}
 }
 
@@ -722,11 +731,8 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 
 func (rf *Raft) propose(command interface{}) {
 	ent := Entry{command, rf.term}
-	if err := rf.rl.Append(ent); err != nil {
-		log.Printf("node %d append entry error: ", rf.me)
-		panic(err)
-	}
-	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
+	rf.rl.Append([]Entry{ent})
+	rf.pt[rf.me].match = rf.rl.lastIndex
 }
 
 func (rf *Raft) run() {
@@ -767,6 +773,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 150 + rand.Intn(200)
+	DPrintf("%d tick election timeout %v ms\n", rf.me, rf.electionTimeout)
 
 	rf.applyCh = applyCh
 
