@@ -2,7 +2,7 @@ package raft
 
 import (
 	"../labrpc"
-	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/fmtsafe/testdata/src/github.com/cockroachdb/errors"
+	"errors"
 	"log"
 	"math/rand"
 	"sync"
@@ -49,12 +49,6 @@ type Entry struct {
 	Term    int
 }
 
-// timeout settings (ms)
-const (
-	MaxTimeout int = 1000
-	MinTimeout int = 500
-)
-
 // indicate Raft node's role
 const (
 	LEADER    = 1
@@ -64,6 +58,9 @@ const (
 
 const NonVote = -1
 
+//
+// raft log implementation
+//
 type raftLog struct {
 	lastIndex   int
 	lastTerm    int
@@ -73,11 +70,19 @@ type raftLog struct {
 
 func (rl *raftLog) Append(ent Entry) error {
 	if ent.Term < rl.lastTerm {
-		return errors.New("receive append entry with less term")
+		return errors.New("receive append entry with old term")
 	}
 	rl.entries = append(rl.entries, ent)
 	rl.lastTerm = ent.Term
 	rl.lastIndex++
+	return nil
+}
+
+func (rl *raftLog) DeleteFrom(begin int) error {
+	if begin <= 0 {
+		return errors.New("delete from invalid index")
+	}
+	rl.entries = rl.entries[:begin]
 	return nil
 }
 
@@ -94,9 +99,8 @@ func (rl *raftLog) Match(index, term int) bool {
 	if rl.lastIndex < index ||
 		rl.entries[index].Term != term {
 		return false
-	} else {
-		return true
 	}
+	return true
 }
 
 func newRaftLog() *raftLog {
@@ -109,15 +113,21 @@ func newRaftLog() *raftLog {
 	return rl
 }
 
-/* ---------- Progress Tracker For Leader ---------- */
+type progress struct {
+	match int
+	next int
+}
 
-type progressTracker struct {
+//
+// progress tracker for leader to trace the progress of log replication
+//
+type progressTracer struct {
 	matchIndex []int
 	nextIndex  []int
 }
 
-func newProgressTracker(n int) *progressTracker {
-	pt := &progressTracker{}
+func newProgressTracer(n int) *progressTracer {
+	pt := &progressTracer{}
 	pt.matchIndex = make([]int, n)
 	pt.nextIndex = make([]int, n)
 	return pt
@@ -138,18 +148,15 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	term     int
+	role     int
 	votedFor int
 
-	role int
-
-	rl *raftLog
-
-	pt *progressTracker
+	rl    *raftLog
+	pt    *progressTracer
+	votes map[int]struct{}
 
 	applyCh chan ApplyMsg
-	done chan struct{}
-
-	votes map[int]struct{}
+	done    chan struct{}
 
 	ticker *time.Ticker
 	tick   func()
@@ -487,7 +494,7 @@ func (rf *Raft) becomeLeader() {
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
 	// reset progress tracker
-	rf.pt = newProgressTracker(len(rf.peers))
+	rf.pt = newProgressTracer(len(rf.peers))
 	rf.pt.matchIndex[rf.me] = rf.rl.lastIndex
 	// try to replicate from the last index
 	for id, _ := range rf.pt.nextIndex {
