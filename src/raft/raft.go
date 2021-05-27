@@ -522,7 +522,7 @@ func (rf *Raft) becomeLeader() {
 // Request Vote RPC handler
 //
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("%d receive request vote %v\n", rf.me, args)
+	DPrintf("[debug vote] %d receive request vote %v\n", rf.me, args)
 	reply.Term = rf.term
 	reply.From = rf.me
 
@@ -532,8 +532,11 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 	}
 
 	if rf.term < args.Term {
+		// note: follower does not need to reset election elapsed
 		rf.term = args.Term
-		rf.becomeFollower()
+		if rf.role != FOLLOWER {
+			rf.becomeFollower()
+		}
 	}
 
 	if rf.votedFor != NonVote {
@@ -550,6 +553,7 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 			return
 		}
 	}
+	rf.votedFor = args.CandidateID
 	reply.VoteGranted = true
 	return
 }
@@ -677,7 +681,7 @@ func insertionSort(sl []int) {
 
 func (rf *Raft) apply(begin, end int) {
 	if end > rf.rl.lastIndex {
-		panic("apply index greater than last index")
+		log.Panicf("apply index %d greater than last index %d", end, rf.rl.lastIndex)
 	}
 	for i := begin; i <= end; i++ {
 		am := ApplyMsg{
@@ -733,6 +737,7 @@ func (rf *Raft) propose(command interface{}) {
 	ent := Entry{command, rf.term}
 	rf.rl.Append([]Entry{ent})
 	rf.pt[rf.me].match = rf.rl.lastIndex
+	DPrintf("[debug propose] %d append 1 entry lastIndex %d lastTerm %d\n", rf.me, rf.rl.lastIndex, rf.rl.lastTerm)
 }
 
 func (rf *Raft) run() {
