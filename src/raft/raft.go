@@ -249,9 +249,10 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
-	From        int
-	VoteGranted bool
+	Term         int
+	From         int
+	VoteGranted  bool
+	RejectReason string
 }
 
 // RequestVote
@@ -543,6 +544,7 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 
 	if rf.term > args.Term {
 		reply.VoteGranted = false
+		reply.RejectReason = "receiver has greater term"
 		return
 	}
 
@@ -552,19 +554,26 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 		if rf.role != FOLLOWER {
 			rf.becomeFollower()
 		}
+		// TODO:
+		// ugly hack to make follower to reset its votedFor field
+		// since follower would not be reset in the previous process
+		rf.votedFor = NonVote
 	}
 
 	if rf.votedFor != NonVote {
 		reply.VoteGranted = false
+		reply.RejectReason = "node has voted in this term"
 		return
 	}
 	if args.LastLogTerm < rf.rl.lastTerm {
 		reply.VoteGranted = false
+		reply.RejectReason = "node's last log term greater than candidate's last term"
 		return
 	}
 	if args.LastLogTerm == rf.rl.lastTerm {
 		if args.LastLogIndex < rf.rl.lastIndex {
 			reply.VoteGranted = false
+			reply.RejectReason = "node's last log index greater than candidate's last log index"
 			return
 		}
 	}
@@ -581,6 +590,7 @@ func (rf *Raft) emptyHandleRequestVoteReply(reply *RequestVoteReply) {
 }
 
 func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
+	DPrintf("[debug repl] %d receive request vote reply %v\n", rf.me, reply)
 	if reply.Term > rf.term {
 		rf.term = reply.Term
 		rf.becomeFollower()
