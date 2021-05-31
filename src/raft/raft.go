@@ -113,6 +113,20 @@ func (rl *raftLog) Take(begin, n int) []Entry {
 	return ent
 }
 
+// find the possible conflict log index for the given term and index
+func (rl *raftLog) FindConflict(term, index int) int {
+	i := index
+	if index > rl.lastIndex {
+		i = rl.lastIndex
+	}
+	for ; i >= 0; i-- {
+		if rl.entries[i].Term <= term {
+			break
+		}
+	}
+	return i
+}
+
 func newRaftLog() *raftLog {
 	rl := &raftLog{}
 	rl.lastIndex = 0
@@ -318,9 +332,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	From    int
-	Success bool
+	Term      int
+	From      int
+	HintIndex int
+	Success   bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -611,12 +626,13 @@ func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 // Append Entries RPC Handler
 //
 func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) == false {
+	if !rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) {
+		hint := rf.rl.FindConflict(args.PrevLogTerm, args.PrevLogIndex)
+		reply.HintIndex = hint
 		reply.Success = false
 		return
 	}
 
-	// TODO: run these logic inside struct raftLog
 	bi := args.PrevLogIndex + 1
 	if err := rf.rl.DeleteFrom(bi); err != nil {
 		log.Fatal(err)
@@ -638,6 +654,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 }
 
 func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("[debug entr] %d receive append entries rpc %v\n", rf.me, args)
 	reply.From = rf.me
 	reply.Term = rf.term
 
@@ -752,7 +769,8 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 		pg.next = pg.match + 1
 		rf.tryCommit()
 	} else {
-		pg.next -= 1
+		pg.next = reply.HintIndex + 1
+		DPrintf("[debug repl] %d leader update next index to %d for %d\n", rf.me, pg.next, from)
 	}
 }
 
