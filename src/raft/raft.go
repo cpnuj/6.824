@@ -65,22 +65,22 @@ type raftLog struct {
 	lastIndex   int
 	lastTerm    int
 	commitIndex int
-	entries     []Entry
+	unstable    []Entry
 }
 
 func (rl *raftLog) Append(ents []Entry) {
-	rl.entries = append(rl.entries, ents...)
+	rl.unstable = append(rl.unstable, ents...)
 	rl.lastIndex += len(ents)
-	rl.lastTerm = rl.entries[rl.lastIndex].Term
+	rl.lastTerm = rl.unstable[rl.lastIndex].Term
 }
 
 func (rl *raftLog) DeleteFrom(from int) error {
 	if from <= 0 {
 		return errors.New("delete from invalid index")
 	}
-	rl.entries = rl.entries[:from]
+	rl.unstable = rl.unstable[:from]
 	rl.lastIndex = from - 1
-	rl.lastTerm = rl.entries[rl.lastIndex].Term
+	rl.lastTerm = rl.unstable[rl.lastIndex].Term
 	return nil
 }
 
@@ -95,7 +95,7 @@ func (rl *raftLog) CommitTo(ci int) bool {
 
 func (rl *raftLog) Match(index, term int) bool {
 	if rl.lastIndex < index ||
-		rl.entries[index].Term != term {
+		rl.unstable[index].Term != term {
 		return false
 	}
 	return true
@@ -109,7 +109,7 @@ func (rl *raftLog) Take(begin, n int) []Entry {
 	}
 	n = end - begin
 	ent := make([]Entry, n)
-	copy(ent, rl.entries[begin:end])
+	copy(ent, rl.unstable[begin:end])
 	return ent
 }
 
@@ -120,7 +120,7 @@ func (rl *raftLog) MaybeMatchAt(term, index int) int {
 		i = rl.lastIndex
 	}
 	for ; i >= 0; i-- {
-		if rl.entries[i].Term <= term {
+		if rl.unstable[i].Term <= term {
 			break
 		}
 	}
@@ -132,8 +132,8 @@ func newRaftLog() *raftLog {
 	rl.lastIndex = 0
 	rl.lastTerm = 0
 	rl.commitIndex = 0
-	rl.entries = make([]Entry, 1)
-	rl.entries[0] = Entry{struct{}{}, 0}
+	rl.unstable = make([]Entry, 1)
+	rl.unstable[0] = Entry{struct{}{}, 0}
 	return rl
 }
 
@@ -376,7 +376,7 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	pg := rf.pt[server]
 	ni := pg.next
 	prevLogIndex := ni - 1
-	prevLogTerm := rf.rl.entries[prevLogIndex].Term
+	prevLogTerm := rf.rl.unstable[prevLogIndex].Term
 	commitIndex := rf.rl.commitIndex
 	// TODO: support send more entries
 	var ents []Entry
@@ -658,7 +658,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	if !rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) {
 		hint := rf.rl.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
 		reply.HintIndex = hint
-		reply.HintTerm = rf.rl.entries[reply.HintIndex].Term
+		reply.HintTerm = rf.rl.unstable[reply.HintIndex].Term
 		reply.Success = false
 		return
 	}
@@ -759,7 +759,7 @@ func (rf *Raft) apply(begin, end int) {
 	for i := begin; i <= end; i++ {
 		am := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.rl.entries[i].Command,
+			Command:      rf.rl.unstable[i].Command,
 			CommandIndex: i,
 		}
 		rf.applyCh <- am
