@@ -113,8 +113,8 @@ func (rl *raftLog) Take(begin, n int) []Entry {
 	return ent
 }
 
-// find the possible conflict log index for the given term and index
-func (rl *raftLog) FindConflict(term, index int) int {
+// find the possible match index of two logs
+func (rl *raftLog) MaybeMatchAt(term, index int) int {
 	i := index
 	if index > rl.lastIndex {
 		i = rl.lastIndex
@@ -144,6 +144,10 @@ func newRaftLog() *raftLog {
 type progress struct {
 	match int
 	next  int
+}
+
+func (pg *progress) DecrTo(matchHint int) {
+	pg.next = min(pg.next - 1, matchHint + 1)
 }
 
 //
@@ -335,6 +339,7 @@ type AppendEntriesReply struct {
 	Term      int
 	From      int
 	HintIndex int
+	HintTerm  int
 	Success   bool
 }
 
@@ -627,8 +632,9 @@ func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 //
 func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if !rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) {
-		hint := rf.rl.FindConflict(args.PrevLogTerm, args.PrevLogIndex)
+		hint := rf.rl.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
 		reply.HintIndex = hint
+		reply.HintTerm = rf.rl.entries[reply.HintIndex].Term
 		reply.Success = false
 		return
 	}
@@ -744,7 +750,7 @@ func (rf *Raft) tryCommit() {
 	insertionSort(arr)
 
 	pos := n - (n/2 + 1)
-	oldci, newci := rf.rl.commitIndex, arr[pos]
+	oldci, newci := rf.rl.commitIndex, max(arr[pos], rf.rl.commitIndex)
 	if ok := rf.rl.CommitTo(newci); ok {
 		rf.apply(oldci+1, newci)
 	}
@@ -769,7 +775,8 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 		pg.next = pg.match + 1
 		rf.tryCommit()
 	} else {
-		pg.next = reply.HintIndex + 1
+		matchHint := rf.rl.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
+		pg.DecrTo(matchHint)
 		DPrintf("[debug repl] %d leader update next index to %d for %d\n", rf.me, pg.next, from)
 	}
 }
