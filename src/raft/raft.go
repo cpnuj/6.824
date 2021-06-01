@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"../labgob"
 	"../labrpc"
+	"bytes"
 	"errors"
 	"log"
 	"math/rand"
@@ -66,6 +68,8 @@ type raftLog struct {
 	lastTerm    int
 	commitIndex int
 	unstable    []Entry
+
+	Stable      []Entry
 }
 
 func (rl *raftLog) Append(ents []Entry) {
@@ -90,6 +94,8 @@ func (rl *raftLog) CommitTo(ci int) bool {
 		return false
 	}
 	rl.commitIndex = ci
+	// save to Stable
+	rl.Stable = rl.unstable[:rl.commitIndex+1]
 	return true
 }
 
@@ -188,9 +194,11 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	term     int
+	// state need to persist
+	Term     int
+	VotedFor int
+
 	role     int
-	votedFor int
 
 	rl    *raftLog
 	pt    progressTracer
@@ -224,7 +232,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term, isLeader := rf.term, rf.role == LEADER
+	term, isLeader := rf.Term, rf.role == LEADER
 	return term, isLeader
 }
 
@@ -242,6 +250,20 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(rf.Term); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(rf.VotedFor); err != nil {
+		log.Fatal(err)
+	}
+	if err := e.Encode(rf.rl.Stable); err != nil {
+		log.Fatal(err)
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -264,6 +286,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	var (
+		term, votedFor int
+		stable []Entry
+	)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil ||
+		d.Decode(stable) != nil {
+		log.Fatal("god decode error")
+	}
+	rf.Term, rf.VotedFor = term, votedFor
+	rf.rl.Stable = stable
 }
 
 // RequestVoteArgs
@@ -456,7 +491,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) tickElection() {
 	rf.electionElapsed++
 	if rf.electionElapsed == rf.electionTimeout {
-		rf.term++
+		rf.Term++
 		rf.becomeCandidate()
 	}
 }
@@ -472,7 +507,7 @@ func (rf *Raft) tickHeartbeat() {
 			}
 			go func(id int) {
 				args := &AppendEntriesArgs{
-					Term: rf.term,
+					Term: rf.Term,
 					From: rf.me,
 				}
 				reply := &AppendEntriesReply{}
@@ -486,9 +521,9 @@ func (rf *Raft) tickHeartbeat() {
 // Machine state transition
 //
 func (rf *Raft) becomeFollower() {
-	DPrintf("[debug node] %d become follower in term %d\n", rf.me, rf.term)
+	DPrintf("[debug node] %d become follower in term %d\n", rf.me, rf.Term)
 	rf.role = FOLLOWER
-	rf.votedFor = NonVote
+	rf.VotedFor = NonVote
 
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
@@ -499,9 +534,9 @@ func (rf *Raft) becomeFollower() {
 }
 
 func (rf *Raft) becomeCandidate() {
-	DPrintf("[debug node] %d become candidate in term %d\n", rf.me, rf.term)
+	DPrintf("[debug node] %d become candidate in term %d\n", rf.me, rf.Term)
 	rf.role = CANDIDATE
-	rf.votedFor = rf.me
+	rf.VotedFor = rf.me
 
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
@@ -521,7 +556,7 @@ func (rf *Raft) becomeCandidate() {
 		}
 		go func(id int) {
 			args := &RequestVoteArgs{
-				Term:         rf.term,
+				Term:         rf.Term,
 				CandidateID:  rf.me,
 				LastLogIndex: rf.rl.lastIndex,
 				LastLogTerm:  rf.rl.lastTerm,
@@ -550,7 +585,7 @@ func (rf *Raft) resetProgressTracker() {
 }
 
 func (rf *Raft) becomeLeader() {
-	DPrintf("[debug node] %d become leader in term %d\n", rf.me, rf.term)
+	DPrintf("[debug node] %d become leader in term %d\n", rf.me, rf.Term)
 	rf.role = LEADER
 
 	rf.tick = rf.tickHeartbeat
@@ -569,7 +604,7 @@ func (rf *Raft) becomeLeader() {
 		}
 		go func(id int) {
 			args := &AppendEntriesArgs{
-				Term: rf.term,
+				Term: rf.Term,
 				From: rf.me,
 			}
 			reply := &AppendEntriesReply{}
@@ -583,28 +618,28 @@ func (rf *Raft) becomeLeader() {
 //
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("[debug vote] %d receive request vote %v\n", rf.me, args)
-	reply.Term = rf.term
+	reply.Term = rf.Term
 	reply.From = rf.me
 
-	if rf.term > args.Term {
+	if rf.Term > args.Term {
 		reply.VoteGranted = false
 		reply.RejectReason = "receiver has greater term"
 		return
 	}
 
-	if rf.term < args.Term {
+	if rf.Term < args.Term {
 		// note: follower does not need to reset election elapsed
-		rf.term = args.Term
+		rf.Term = args.Term
 		if rf.role != FOLLOWER {
 			rf.becomeFollower()
 		}
 		// TODO:
-		// ugly hack to make follower to reset its votedFor field
+		// ugly hack to make follower to reset its VotedFor field
 		// since follower would not be reset in the previous process
-		rf.votedFor = NonVote
+		rf.VotedFor = NonVote
 	}
 
-	if rf.votedFor != NonVote {
+	if rf.VotedFor != NonVote {
 		reply.VoteGranted = false
 		reply.RejectReason = "node has voted in this term"
 		return
@@ -621,7 +656,7 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 			return
 		}
 	}
-	rf.votedFor = args.CandidateID
+	rf.VotedFor = args.CandidateID
 	reply.VoteGranted = true
 	return
 }
@@ -635,8 +670,8 @@ func (rf *Raft) emptyHandleRequestVoteReply(reply *RequestVoteReply) {
 
 func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
 	DPrintf("[debug repl] %d receive request vote reply %v\n", rf.me, reply)
-	if reply.Term > rf.term {
-		rf.term = reply.Term
+	if reply.Term > rf.Term {
+		rf.Term = reply.Term
 		rf.becomeFollower()
 		return
 	}
@@ -677,6 +712,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 			newci = rf.rl.lastIndex
 		}
 		if ok := rf.rl.CommitTo(newci); ok {
+			rf.persist()
 			rf.apply(oldci+1, newci)
 		}
 	}
@@ -686,18 +722,18 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintf("[debug entr] %d receive append entries rpc %v\n", rf.me, args)
 	reply.From = rf.me
-	reply.Term = rf.term
+	reply.Term = rf.Term
 
-	if rf.term > args.Term {
+	if rf.Term > args.Term {
 		reply.Success = false
 		return
 	}
 
 	rf.electionElapsed = 0
 
-	if rf.term < args.Term {
-		rf.term = args.Term
-		rf.votedFor = args.From
+	if rf.Term < args.Term {
+		rf.Term = args.Term
+		rf.VotedFor = args.From
 	}
 
 	rf.tryAppendEntries(args, reply)
@@ -706,17 +742,17 @@ func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *Appe
 // TODO: candidate and leader share the same logic, modify it
 func (rf *Raft) candidateHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.From = rf.me
-	reply.Term = rf.term
+	reply.Term = rf.Term
 
-	if rf.term > args.Term {
+	if rf.Term > args.Term {
 		reply.Success = false
 		return
 	}
 
-	if rf.term <= args.Term {
-		rf.term = args.Term
+	if rf.Term <= args.Term {
+		rf.Term = args.Term
 		rf.becomeFollower()
-		rf.votedFor = args.From
+		rf.VotedFor = args.From
 	}
 
 	rf.tryAppendEntries(args, reply)
@@ -724,17 +760,17 @@ func (rf *Raft) candidateHandleAppendEntries(args *AppendEntriesArgs, reply *App
 
 func (rf *Raft) leaderHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.From = rf.me
-	reply.Term = rf.term
+	reply.Term = rf.Term
 
-	if rf.term > args.Term {
+	if rf.Term > args.Term {
 		reply.Success = false
 		return
 	}
 
-	if rf.term <= args.Term {
-		rf.term = args.Term
+	if rf.Term <= args.Term {
+		rf.Term = args.Term
 		rf.becomeFollower()
-		rf.votedFor = args.From
+		rf.VotedFor = args.From
 	}
 
 	rf.tryAppendEntries(args, reply)
@@ -777,6 +813,7 @@ func (rf *Raft) tryCommit() {
 	pos := n - (n/2 + 1)
 	oldci, newci := rf.rl.commitIndex, max(arr[pos], rf.rl.commitIndex)
 	if ok := rf.rl.CommitTo(newci); ok {
+		rf.persist()
 		rf.apply(oldci+1, newci)
 	}
 }
@@ -784,8 +821,8 @@ func (rf *Raft) tryCommit() {
 func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	from := reply.From
 
-	if reply.Term > rf.term {
-		rf.term = reply.Term
+	if reply.Term > rf.Term {
+		rf.Term = reply.Term
 		rf.becomeFollower()
 		return
 	}
@@ -816,7 +853,7 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 // Propose Command to Leader
 //
 func (rf *Raft) propose(command interface{}) {
-	ent := Entry{command, rf.term}
+	ent := Entry{command, rf.Term}
 	rf.rl.Append([]Entry{ent})
 	rf.pt[rf.me].match = rf.rl.lastIndex
 }
