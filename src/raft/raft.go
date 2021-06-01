@@ -76,6 +76,13 @@ func (rl *raftLog) Append(ents []Entry) {
 	rl.lastTerm = rl.unstable[rl.lastIndex].Term
 }
 
+func (rl *raftLog) SetEntries(ents []Entry) {
+	rl.unstable = ents
+	rl.lastIndex = len(ents)-1
+	rl.lastTerm = rl.unstable[rl.lastIndex].Term
+	rl.commitIndex = rl.lastIndex
+}
+
 func (rl *raftLog) DeleteFrom(from int) error {
 	if from <= 0 {
 		return errors.New("delete from invalid index")
@@ -322,7 +329,7 @@ func (rf *Raft) readPersist(data []byte) {
 		log.Fatal("readPersist: ", err)
 	}
 	rf.Term, rf.VotedFor = s.GetTerm(), s.GetVotedFor()
-	rf.rl.unstable = s.GetEntries()
+	rf.rl.SetEntries(s.GetEntries())
 }
 
 // RequestVoteArgs
