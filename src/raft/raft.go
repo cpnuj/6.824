@@ -144,6 +144,20 @@ func newRaftLog() *raftLog {
 type progress struct {
 	match int
 	next  int
+	state int
+}
+
+const (
+	StateProbe = iota
+	StateReplicate
+)
+
+func (pg *progress) BecomeProbe() {
+	pg.state = StateProbe
+}
+
+func (pg *progress) BecomeReplicate() {
+	pg.state = StateReplicate
 }
 
 func (pg *progress) DecrTo(matchHint int) {
@@ -193,6 +207,9 @@ type Raft struct {
 
 	electionTimeout  int
 	heartbeatTimeout int
+
+	// max number of entries to be sent in one rpc
+	maxNumSentEntries int
 
 	// handler
 	handleRequestVote        func(args *RequestVoteArgs, reply *RequestVoteReply)
@@ -356,13 +373,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	pt := rf.pt[server]
-	ni := pt.next
+	pg := rf.pt[server]
+	ni := pg.next
 	prevLogIndex := ni - 1
 	prevLogTerm := rf.rl.entries[prevLogIndex].Term
 	commitIndex := rf.rl.commitIndex
 	// TODO: support send more entries
-	ents := rf.rl.Take(ni, 1)
+	var ents []Entry
+	switch pg.state {
+	case StateProbe:
+		ents = rf.rl.Take(ni, 1)
+	case StateReplicate:
+		ents = rf.rl.Take(ni, rf.maxNumSentEntries)
+	}
 	rf.mu.Unlock()
 
 	args.PrevLogIndex = prevLogIndex
@@ -521,6 +544,7 @@ func (rf *Raft) resetProgressTracker() {
 			match: 0,
 			next:  rf.rl.lastIndex + 1,
 		}
+		pt[i].BecomeProbe()
 	}
 	rf.pt = pt
 }
@@ -771,10 +795,16 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 
 	pg := rf.pt[from]
 	if reply.Success {
+		if pg.state == StateProbe {
+			pg.BecomeReplicate()
+		}
 		pg.match = pg.next + len(args.Entries) - 1
 		pg.next = pg.match + 1
 		rf.tryCommit()
 	} else {
+		if pg.state == StateReplicate {
+			pg.BecomeProbe()
+		}
 		matchHint := rf.rl.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
 		pg.DecrTo(matchHint)
 		DPrintf("[debug repl] %d leader update next index to %d for %d\n", rf.me, pg.next, from)
@@ -827,6 +857,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 150 + rand.Intn(200)
+	rf.maxNumSentEntries = 20
 	DPrintf("%d tick election timeout %v ms\n", rf.me, rf.electionTimeout)
 
 	rf.applyCh = applyCh
