@@ -68,8 +68,6 @@ type raftLog struct {
 	lastTerm    int
 	commitIndex int
 	unstable    []Entry
-
-	Stable      []Entry
 }
 
 func (rl *raftLog) Append(ents []Entry) {
@@ -94,8 +92,6 @@ func (rl *raftLog) CommitTo(ci int) bool {
 		return false
 	}
 	rl.commitIndex = ci
-	// save to Stable
-	rl.Stable = rl.unstable[:rl.commitIndex+1]
 	return true
 }
 
@@ -133,6 +129,10 @@ func (rl *raftLog) MaybeMatchAt(term, index int) int {
 	return i
 }
 
+func (rl *raftLog) GetStable() []Entry {
+	return rl.unstable[:rl.commitIndex+1]
+}
+
 func newRaftLog() *raftLog {
 	rl := &raftLog{}
 	rl.lastIndex = 0
@@ -141,6 +141,38 @@ func newRaftLog() *raftLog {
 	rl.unstable = make([]Entry, 1)
 	rl.unstable[0] = Entry{struct{}{}, 0}
 	return rl
+}
+
+type StableImpl struct {
+	Term int
+	VotedFor int
+	Entries []Entry
+}
+
+func (s *StableImpl) GetTerm() int {
+	return s.Term
+}
+
+func (s *StableImpl) GetVotedFor() int {
+	return s.VotedFor
+}
+
+func (s *StableImpl) GetEntries() []Entry {
+	return s.Entries
+}
+
+func MakeStable (term, votedFor int, entries []Entry) StableImpl {
+	return StableImpl{
+		Term:     term,
+		VotedFor: votedFor,
+		Entries:  entries,
+	}
+}
+
+type Stable interface {
+	GetTerm() int
+	GetVotedFor() int
+	GetEntries() []Entry
 }
 
 //
@@ -251,15 +283,11 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
+	stable := MakeStable(rf.Term, rf.VotedFor, rf.rl.GetStable())
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	if err := e.Encode(rf.Term); err != nil {
-		log.Fatal(err)
-	}
-	if err := e.Encode(rf.VotedFor); err != nil {
-		log.Fatal(err)
-	}
-	if err := e.Encode(rf.rl.Stable); err != nil {
+	if err := e.Encode(stable); err != nil {
 		log.Fatal(err)
 	}
 	data := w.Bytes()
@@ -287,18 +315,14 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 
-	var (
-		term, votedFor int
-		stable []Entry
-	)
+	s := StableImpl{}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil ||
-		d.Decode(stable) != nil {
-		log.Fatal("god decode error")
+	if err := d.Decode(&s); err != nil {
+		log.Fatal("readPersist: ", err)
 	}
-	rf.Term, rf.VotedFor = term, votedFor
-	rf.rl.Stable = stable
+	rf.Term, rf.VotedFor = s.GetTerm(), s.GetVotedFor()
+	rf.rl.unstable = s.GetEntries()
 }
 
 // RequestVoteArgs
@@ -894,6 +918,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.done = make(chan struct{})
 
 	// Your initialization code here (2A, 2B, 2C).
+
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 150 + rand.Intn(200)
 	rf.maxNumSentEntries = 20
@@ -902,6 +927,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	rf.rl = newRaftLog()
+	// register persist field
+	labgob.Register(struct{}{})
+	labgob.Register(StableImpl{})
+
+	// restart from persister
+	rf.readPersist(persister.ReadRaftState())
 
 	rf.becomeFollower()
 	go rf.run()
