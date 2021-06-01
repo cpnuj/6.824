@@ -740,8 +740,9 @@ func (rf *Raft) leaderHandleAppendEntries(args *AppendEntriesArgs, reply *Append
 	rf.tryAppendEntries(args, reply)
 }
 
-/* ---------- Append Entries Reply RPC Handler ---------- */
-
+//
+// Append Entries Reply RPC Handler
+//
 func insertionSort(sl []int) {
 	a, b := 0, len(sl)
 	for i := a + 1; i < b; i++ {
@@ -811,8 +812,9 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 	}
 }
 
-/* ---------- Propose Command to Leader ---------- */
-
+//
+// Propose Command to Leader
+//
 func (rf *Raft) propose(command interface{}) {
 	ent := Entry{command, rf.term}
 	rf.rl.Append([]Entry{ent})
