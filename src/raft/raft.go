@@ -64,22 +64,16 @@ const NonVote = -1
 // raft log implementation
 //
 type raftLog struct {
-	lastIndex   int
-	lastTerm    int
 	commitIndex int
 	entries     []Entry
 }
 
 func (rl *raftLog) Append(ents []Entry) {
 	rl.entries = append(rl.entries, ents...)
-	rl.lastIndex += len(ents)
-	rl.lastTerm = rl.entries[rl.lastIndex].Term
 }
 
 func (rl *raftLog) SetEntries(ents []Entry) {
 	rl.entries = ents
-	rl.lastIndex = len(ents) - 1
-	rl.lastTerm = rl.entries[rl.lastIndex].Term
 }
 
 func (rl *raftLog) DeleteFrom(from int) error {
@@ -87,8 +81,6 @@ func (rl *raftLog) DeleteFrom(from int) error {
 		return errors.New("delete from invalid index")
 	}
 	rl.entries = rl.entries[:from]
-	rl.lastIndex = from - 1
-	rl.lastTerm = rl.entries[rl.lastIndex].Term
 	return nil
 }
 
@@ -101,7 +93,7 @@ func (rl *raftLog) CommitTo(ci int) bool {
 }
 
 func (rl *raftLog) Match(index, term int) bool {
-	if rl.lastIndex < index ||
+	if rl.LastIndex() < index ||
 		rl.entries[index].Term != term {
 		return false
 	}
@@ -110,10 +102,7 @@ func (rl *raftLog) Match(index, term int) bool {
 
 // take the copy of n entries from raft log
 func (rl *raftLog) Take(begin, n int) []Entry {
-	end := begin + n
-	if end > rl.lastIndex+1 {
-		end = rl.lastIndex + 1
-	}
+	end := min(begin + n, rl.LastIndex() + 1)
 	n = end - begin
 	ent := make([]Entry, n)
 	copy(ent, rl.entries[begin:end])
@@ -122,9 +111,9 @@ func (rl *raftLog) Take(begin, n int) []Entry {
 
 // find the possible match index of two logs
 func (rl *raftLog) MaybeMatchAt(term, index int) int {
-	i := index
-	if index > rl.lastIndex {
-		i = rl.lastIndex
+	i, li := index, rl.LastIndex()
+	if index > li {
+		i = li
 	}
 	for ; i >= 0; i-- {
 		if rl.entries[i].Term <= term {
@@ -134,14 +123,20 @@ func (rl *raftLog) MaybeMatchAt(term, index int) int {
 	return i
 }
 
+func (rl *raftLog) LastIndex() int {
+	return len(rl.entries) - 1
+}
+
+func (rl *raftLog) LastTerm() int {
+	return rl.entries[rl.LastIndex()].Term
+}
+
 func (rl *raftLog) Entries() []Entry {
 	return rl.entries
 }
 
 func newRaftLog() *raftLog {
 	rl := &raftLog{}
-	rl.lastIndex = 0
-	rl.lastTerm = 0
 	rl.commitIndex = 0
 	rl.entries = make([]Entry, 1)
 	rl.entries[0] = Entry{struct{}{}, 0}
@@ -188,7 +183,7 @@ func (pg *progress) BecomeReplicate() {
 }
 
 func (pg *progress) DecrTo(matchHint int) {
-	pg.next = min(pg.next-1, matchHint+1)
+	pg.next = max(min(pg.next-1, matchHint+1), 1)
 }
 
 //
@@ -432,6 +427,7 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	pg := rf.pt[server]
 	ni := pg.next
 	prevLogIndex := ni - 1
+	DPrintf("[debug prog] %d leader sending hb to %d next index %d\n", rf.me, server, ni)
 	prevLogTerm := rf.rl.entries[prevLogIndex].Term
 	commitIndex := rf.rl.commitIndex
 
@@ -481,7 +477,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != LEADER {
 		return 0, 0, false
 	} else {
-		index, term := rf.rl.lastIndex+1, rf.Term
+		index, term := rf.rl.LastIndex()+1, rf.Term
 		rf.propose(command)
 		return index, term, true
 	}
@@ -583,8 +579,8 @@ func (rf *Raft) becomeCandidate() {
 			args := &RequestVoteArgs{
 				Term:         rf.Term,
 				CandidateID:  rf.me,
-				LastLogIndex: rf.rl.lastIndex,
-				LastLogTerm:  rf.rl.lastTerm,
+				LastLogIndex: rf.rl.LastIndex(),
+				LastLogTerm:  rf.rl.LastTerm(),
 			}
 
 			reply := &RequestVoteReply{}
@@ -597,12 +593,12 @@ func (rf *Raft) resetProgressTracker() {
 	pt := makeProgressTracer(len(rf.peers))
 	for i, _ := range pt {
 		if i == rf.me {
-			pt[i] = &progress{match: rf.rl.lastIndex}
+			pt[i] = &progress{match: rf.rl.LastIndex()}
 			continue
 		}
 		pt[i] = &progress{
 			match: 0,
-			next:  rf.rl.lastIndex + 1,
+			next:  rf.rl.LastIndex() + 1,
 		}
 		pt[i].BecomeProbe()
 	}
@@ -668,13 +664,13 @@ func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVot
 		reply.RejectReason = "node has voted in this term"
 		return
 	}
-	if args.LastLogTerm < rf.rl.lastTerm {
+	if args.LastLogTerm < rf.rl.LastTerm() {
 		reply.VoteGranted = false
 		reply.RejectReason = "node's last log term greater than candidate's last term"
 		return
 	}
-	if args.LastLogTerm == rf.rl.lastTerm {
-		if args.LastLogIndex < rf.rl.lastIndex {
+	if args.LastLogTerm == rf.rl.LastTerm() {
+		if args.LastLogIndex < rf.rl.LastIndex() {
 			reply.VoteGranted = false
 			reply.RejectReason = "node's last log index greater than candidate's last log index"
 			return
@@ -730,10 +726,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	reply.Success = true
 
 	if args.CommitIndex > rf.rl.commitIndex {
-		oldci, newci := rf.rl.commitIndex, args.CommitIndex
-		if newci > rf.rl.lastIndex {
-			newci = rf.rl.lastIndex
-		}
+		oldci, newci := rf.rl.commitIndex, min(args.CommitIndex, rf.rl.LastIndex())
 		if ok := rf.rl.CommitTo(newci); ok {
 			rf.apply(oldci+1, newci)
 		}
@@ -810,8 +803,8 @@ func insertionSort(sl []int) {
 }
 
 func (rf *Raft) apply(begin, end int) {
-	if end > rf.rl.lastIndex {
-		log.Panicf("apply index %d greater than last index %d", end, rf.rl.lastIndex)
+	if end > rf.rl.LastIndex() {
+		log.Panicf("apply index %d greater than last index %d", end, rf.rl.LastIndex())
 	}
 	for i := begin; i <= end; i++ {
 		am := ApplyMsg{
@@ -881,7 +874,7 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 func (rf *Raft) propose(command interface{}) {
 	ent := Entry{command, rf.Term}
 	rf.rl.Append([]Entry{ent})
-	rf.pt[rf.me].match = rf.rl.lastIndex
+	rf.pt[rf.me].match = rf.rl.LastIndex()
 }
 
 func (rf *Raft) run() {
