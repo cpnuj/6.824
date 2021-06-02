@@ -77,7 +77,7 @@ func (rl *raftLog) SetEntries(ents []Entry) {
 }
 
 func (rl *raftLog) DeleteFrom(from int) error {
-	if from <= 0 {
+	if from <= rl.commitIndex {
 		return errors.New("delete from invalid index")
 	}
 	rl.entries = rl.entries[:from]
@@ -440,7 +440,6 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	pg := rf.pt[server]
 	ni := pg.next
 	prevLogIndex := ni - 1
-	DPrintf("[debug prog] %d leader sending hb to %d next index %d\n", rf.me, server, ni)
 	prevLogTerm := rf.rl.entries[prevLogIndex].Term
 	commitIndex := rf.rl.commitIndex
 
@@ -453,6 +452,8 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 		ents = rf.rl.Take(ni, rf.maxNumSentEntries)
 	}
 
+	DPrintf("[debug send] %d send hb to %d prev index: %d, prev log term: %d, commit index: %d, len ents: %d}\n",
+		rf.me, server, prevLogIndex, prevLogTerm, commitIndex, len(ents))
 	rf.mu.Unlock()
 
 	args.PrevLogIndex = prevLogIndex
@@ -730,11 +731,21 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		return
 	}
 
+	ents := args.Entries
 	bi := args.PrevLogIndex + 1
+	// find the conflict log pos to start append
+	// can avoid deleting the correct appended entries
+	for _, e := range args.Entries {
+		if !rf.rl.Match(bi, e.Term) {
+			break
+		}
+		bi++
+		ents = ents[1:]
+	}
 	if err := rf.rl.DeleteFrom(bi); err != nil {
 		log.Fatal(err)
 	}
-	rf.rl.Append(args.Entries)
+	rf.rl.Append(ents)
 
 	reply.Success = true
 
@@ -869,7 +880,7 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 			pg.BecomeReplicate()
 		}
 		// TODO: what if leader receive response for 2 rpc with the same entries
-		pg.match = pg.next + len(args.Entries) - 1
+		pg.match = max(pg.match, args.PrevLogIndex + len(args.Entries))
 		pg.next = pg.match + 1
 		rf.tryCommit()
 	} else {
@@ -930,7 +941,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 150 + rand.Intn(200)
-	rf.maxNumSentEntries = 20
+	rf.maxNumSentEntries = 50
 
 	rf.applyCh = applyCh
 
