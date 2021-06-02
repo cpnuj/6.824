@@ -383,6 +383,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	if rf.role != CANDIDATE {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
 	if ok := rf.sendRequestVote(server, args, reply); ok {
 		rf.mu.Lock()
 		rf.handleRequestVoteReply(reply)
@@ -423,6 +430,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+
+	// If node is not leader before sending this rpc, quit
+	if rf.role != LEADER {
+		rf.mu.Unlock()
+		return
+	}
 
 	pg := rf.pt[server]
 	ni := pg.next
