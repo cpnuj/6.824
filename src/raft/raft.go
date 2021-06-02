@@ -80,7 +80,6 @@ func (rl *raftLog) SetEntries(ents []Entry) {
 	rl.unstable = ents
 	rl.lastIndex = len(ents)-1
 	rl.lastTerm = rl.unstable[rl.lastIndex].Term
-	rl.commitIndex = rl.lastIndex
 }
 
 func (rl *raftLog) DeleteFrom(from int) error {
@@ -94,8 +93,7 @@ func (rl *raftLog) DeleteFrom(from int) error {
 }
 
 func (rl *raftLog) CommitTo(ci int) bool {
-	if ci < rl.commitIndex {
-		log.Printf("try to commit to a smaller index\n")
+	if ci <= rl.commitIndex {
 		return false
 	}
 	rl.commitIndex = ci
@@ -136,8 +134,8 @@ func (rl *raftLog) MaybeMatchAt(term, index int) int {
 	return i
 }
 
-func (rl *raftLog) GetStable() []Entry {
-	return rl.unstable[:rl.commitIndex+1]
+func (rl *raftLog) Entries() []Entry {
+	return rl.unstable
 }
 
 func newRaftLog() *raftLog {
@@ -150,36 +148,20 @@ func newRaftLog() *raftLog {
 	return rl
 }
 
-type StableImpl struct {
+type Stable struct {
 	Term int
 	VotedFor int
+	Commit int
 	Entries []Entry
 }
 
-func (s *StableImpl) GetTerm() int {
-	return s.Term
-}
-
-func (s *StableImpl) GetVotedFor() int {
-	return s.VotedFor
-}
-
-func (s *StableImpl) GetEntries() []Entry {
-	return s.Entries
-}
-
-func MakeStable (term, votedFor int, entries []Entry) StableImpl {
-	return StableImpl{
+func MakeStable(term, votedFor, commit int, entries []Entry) Stable {
+	return Stable{
 		Term:     term,
 		VotedFor: votedFor,
+		Commit: commit,
 		Entries:  entries,
 	}
-}
-
-type Stable interface {
-	GetTerm() int
-	GetVotedFor() int
-	GetEntries() []Entry
 }
 
 //
@@ -290,7 +272,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	stable := MakeStable(rf.Term, rf.VotedFor, rf.rl.GetStable())
+	stable := MakeStable(rf.Term, rf.VotedFor, rf.rl.commitIndex, rf.rl.Entries())
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -322,14 +304,18 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 
-	s := StableImpl{}
+	s := Stable{}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	if err := d.Decode(&s); err != nil {
 		log.Fatal("readPersist: ", err)
 	}
-	rf.Term, rf.VotedFor = s.GetTerm(), s.GetVotedFor()
-	rf.rl.SetEntries(s.GetEntries())
+	// TODO: when restore from previously persisted state
+	// becomeFollower would rewrite the term field
+	rf.Term, rf.VotedFor = s.Term, s.VotedFor
+	rf.rl.SetEntries(s.Entries)
+	rf.rl.CommitTo(s.Commit)
+	DPrintf("[debug read] %d restore with stable status %v\n", rf.me, s)
 }
 
 // RequestVoteArgs
@@ -363,6 +349,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	rf.handleRequestVote(args, reply)
+	rf.persist()
 	rf.mu.Unlock()
 }
 
@@ -404,6 +391,7 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 	if ok := rf.sendRequestVote(server, args, reply); ok {
 		rf.mu.Lock()
 		rf.handleRequestVoteReply(reply)
+		rf.persist()
 		rf.mu.Unlock()
 	}
 }
@@ -429,6 +417,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	rf.handleAppendEntries(args, reply)
+	rf.persist()
 	rf.mu.Unlock()
 }
 
@@ -439,12 +428,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+
 	pg := rf.pt[server]
 	ni := pg.next
 	prevLogIndex := ni - 1
 	prevLogTerm := rf.rl.unstable[prevLogIndex].Term
 	commitIndex := rf.rl.commitIndex
-	// TODO: support send more entries
+
+	// prepare entries
 	var ents []Entry
 	switch pg.state {
 	case StateProbe:
@@ -452,6 +443,7 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	case StateReplicate:
 		ents = rf.rl.Take(ni, rf.maxNumSentEntries)
 	}
+
 	rf.mu.Unlock()
 
 	args.PrevLogIndex = prevLogIndex
@@ -462,6 +454,7 @@ func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, 
 	if ok := rf.sendAppendEntries(server, args, reply); ok {
 		rf.mu.Lock()
 		rf.handleAppendEntriesReply(args, reply)
+		rf.persist()
 		rf.mu.Unlock()
 	}
 }
@@ -484,10 +477,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if rf.role != LEADER {
 		return 0, 0, false
 	} else {
-		index, term := rf.rl.lastIndex+1, rf.rl.lastTerm
+		index, term := rf.rl.lastIndex+1, rf.Term
 		rf.propose(command)
 		return index, term, true
 	}
@@ -648,7 +642,6 @@ func (rf *Raft) becomeLeader() {
 // Request Vote RPC handler
 //
 func (rf *Raft) commonHandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("[debug vote] %d receive request vote %v\n", rf.me, args)
 	reply.Term = rf.Term
 	reply.From = rf.me
 
@@ -700,7 +693,6 @@ func (rf *Raft) emptyHandleRequestVoteReply(reply *RequestVoteReply) {
 }
 
 func (rf *Raft) candidateHandleRequestVoteReply(reply *RequestVoteReply) {
-	DPrintf("[debug repl] %d receive request vote reply %v\n", rf.me, reply)
 	if reply.Term > rf.Term {
 		rf.Term = reply.Term
 		rf.becomeFollower()
@@ -743,7 +735,6 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 			newci = rf.rl.lastIndex
 		}
 		if ok := rf.rl.CommitTo(newci); ok {
-			rf.persist()
 			rf.apply(oldci+1, newci)
 		}
 	}
@@ -751,7 +742,6 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 }
 
 func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	DPrintf("[debug entr] %d receive append entries rpc %v\n", rf.me, args)
 	reply.From = rf.me
 	reply.Term = rf.Term
 
@@ -843,8 +833,13 @@ func (rf *Raft) tryCommit() {
 
 	pos := n - (n/2 + 1)
 	oldci, newci := rf.rl.commitIndex, max(arr[pos], rf.rl.commitIndex)
+
+	// cannot commit entries from previous term
+	if rf.rl.unstable[newci].Term != rf.Term {
+		return
+	}
+
 	if ok := rf.rl.CommitTo(newci); ok {
-		rf.persist()
 		rf.apply(oldci+1, newci)
 	}
 }
@@ -867,6 +862,7 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 		if pg.state == StateProbe {
 			pg.BecomeReplicate()
 		}
+		// TODO: what if leader receive response for 2 rpc with the same entries
 		pg.match = pg.next + len(args.Entries) - 1
 		pg.next = pg.match + 1
 		rf.tryCommit()
@@ -876,7 +872,6 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 		}
 		matchHint := rf.rl.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
 		pg.DecrTo(matchHint)
-		DPrintf("[debug repl] %d leader update next index to %d for %d\n", rf.me, pg.next, from)
 	}
 }
 
@@ -897,6 +892,7 @@ func (rf *Raft) run() {
 		case <-rf.ticker.C:
 			rf.mu.Lock()
 			rf.tick()
+			rf.persist()
 			rf.mu.Unlock()
 		case <-rf.done:
 			return
@@ -929,14 +925,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 150 + rand.Intn(200)
 	rf.maxNumSentEntries = 20
-	DPrintf("%d tick election timeout %v ms\n", rf.me, rf.electionTimeout)
 
 	rf.applyCh = applyCh
 
 	rf.rl = newRaftLog()
 	// register persist field
 	labgob.Register(struct{}{})
-	labgob.Register(StableImpl{})
+	labgob.Register(Stable{})
 
 	// restart from persister
 	rf.readPersist(persister.ReadRaftState())
