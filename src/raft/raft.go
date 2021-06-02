@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"math/rand"
@@ -398,8 +399,14 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 	}
 }
 
+const (
+	HeartBeat = iota
+	LogReplicate
+)
+
 // AppendEntries RPC
 type AppendEntriesArgs struct {
+	Type         int
 	Term         int
 	From         int
 	PrevLogIndex int
@@ -743,6 +750,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		ents = ents[1:]
 	}
 	if err := rf.rl.DeleteFrom(bi); err != nil {
+		DPrintf("[debug err ] %d delete from %d commit index %d\n", rf.me, bi, rf.rl.commitIndex)
 		log.Fatal(err)
 	}
 	rf.rl.Append(ents)
@@ -889,6 +897,20 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 		}
 		matchHint := rf.rl.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
 		pg.DecrTo(matchHint)
+	}
+}
+
+//
+// log replicate rpc worker
+//
+func (rf *Raft) createLogReplicateWorker(ctx context.Context, server int) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+
+		}
 	}
 }
 
