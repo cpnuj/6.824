@@ -473,6 +473,9 @@ func (rf *Raft) sendAndHandleAppendEntries(server, t int) {
 		args.PrevLogTerm = prevLogTerm
 		args.CommitIndex = commitIndex
 		args.Entries = ents
+
+		DPrintf("[debug repl] %d send log replicate to %d prev log index %d prev log term %d commit index %d len ents %d\n",
+			rf.me, server, args.PrevLogIndex, args.PrevLogTerm, args.CommitIndex, len(args.Entries))
 	}
 	reply := &AppendEntriesReply{}
 	rf.mu.Unlock()
@@ -930,6 +933,8 @@ func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *A
 //
 func (rf *Raft) createLogReplicateWorker(ctx context.Context, server int) {
 	for {
+		// TODO: naive way to control rpc bytes
+		time.Sleep(10*time.Millisecond)
 		select {
 		case <-ctx.Done():
 			return
