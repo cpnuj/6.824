@@ -52,10 +52,6 @@ type Entry struct {
 	Term    int
 }
 
-// GuardCommand is proposed when a new leader is elected
-type guardCommand struct {
-}
-
 // indicate Raft node's role
 const (
 	Leader = iota
@@ -168,7 +164,7 @@ type Stable struct {
 	Entries  []Entry
 }
 
-func MakeStable(term, votedFor, commit int, entries []Entry) Stable {
+func makeStable(term, votedFor, commit int, entries []Entry) Stable {
 	return Stable{
 		Term:     term,
 		VotedFor: votedFor,
@@ -288,7 +284,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	stable := MakeStable(rf.Term, rf.VotedFor, rf.rl.commitIndex, rf.rl.Entries())
+	stable := makeStable(rf.Term, rf.VotedFor, rf.rl.commitIndex, rf.rl.Entries())
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -326,8 +322,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if err := d.Decode(&s); err != nil {
 		log.Fatal("readPersist: ", err)
 	}
-	// TODO: when restore from previously persisted state
-	// becomeFollower would rewrite the term field
 	rf.Term, rf.VotedFor = s.Term, s.VotedFor
 	rf.rl.SetEntries(s.Entries)
 	rf.rl.CommitTo(s.Commit)
@@ -418,8 +412,6 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 		rf.handleRequestVoteReply(reply)
 		rf.persist()
 		rf.mu.Unlock()
-	} else {
-		// DPrintf("[debug vote] %d send request vote to %d network fail\n", rf.me, server)
 	}
 }
 
@@ -734,7 +726,6 @@ func (rf *Raft) becomeLeader() {
 		// create log replicate worker
 		go rf.createLogReplicateWorker(ctx, i)
 	}
-	rf.propose(guardCommand{})
 }
 
 //
@@ -1071,7 +1062,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// register persist field
 	labgob.Register(struct{}{})
 	labgob.Register(Stable{})
-	labgob.Register(guardCommand{})
 
 	// restart from persister
 	rf.readPersist(persister.ReadRaftState())
