@@ -52,6 +52,10 @@ type Entry struct {
 	Term    int
 }
 
+// GuardCommand is proposed when a new leader is elected
+type guardCommand struct {
+}
+
 // indicate Raft node's role
 const (
 	Leader = iota
@@ -414,6 +418,8 @@ func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, repl
 		rf.handleRequestVoteReply(reply)
 		rf.persist()
 		rf.mu.Unlock()
+	} else {
+		// DPrintf("[debug vote] %d send request vote to %d network fail\n", rf.me, server)
 	}
 }
 
@@ -489,8 +495,8 @@ func (rf *Raft) sendAndHandleAppendEntries(server, t int) {
 		args.CommitIndex = commitIndex
 		args.Entries = ents
 
-		DPrintf("[debug repl] %d send log replicate to %d prev log index %d prev log term %d commit index %d len ents %d\n",
-			rf.me, server, args.PrevLogIndex, args.PrevLogTerm, args.CommitIndex, len(args.Entries))
+		// DPrintf("[debug repl] %d send log replicate to %d prev log index %d prev log term %d commit index %d len ents %d\n",
+		//	rf.me, server, args.PrevLogIndex, args.PrevLogTerm, args.CommitIndex, len(args.Entries))
 	}
 	reply := &AppendEntriesReply{}
 	rf.mu.Unlock()
@@ -526,6 +532,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, 0, false
 	} else {
 		index, term := rf.rl.LastIndex()+1, rf.Term
+		DPrintf("[debug prop] %d receive propose %v index %d term %d\n", rf.me, command, index, term)
 		rf.propose(command)
 		return index, term, true
 	}
@@ -727,6 +734,7 @@ func (rf *Raft) becomeLeader() {
 		// create log replicate worker
 		go rf.createLogReplicateWorker(ctx, i)
 	}
+	rf.propose(guardCommand{})
 }
 
 //
@@ -839,6 +847,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	if args.CommitIndex > rf.rl.commitIndex {
 		oldci, newci := rf.rl.commitIndex, min(args.CommitIndex, rf.rl.LastIndex())
 		if ok := rf.rl.CommitTo(newci); ok {
+			DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
 			rf.apply(oldci+1, newci)
 		}
 	}
@@ -922,9 +931,10 @@ func (rf *Raft) apply(begin, end int) {
 		log.Panicf("apply index %d greater than last index %d", end, rf.rl.LastIndex())
 	}
 	for i := begin; i <= end; i++ {
+		cmd := rf.rl.Entries()[i].Command
 		am := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.rl.entries[i].Command,
+			Command:      cmd,
 			CommandIndex: i,
 		}
 		rf.applyCh <- am
@@ -948,6 +958,7 @@ func (rf *Raft) tryCommit() {
 	}
 
 	if ok := rf.rl.CommitTo(newci); ok {
+		DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
 		rf.apply(oldci+1, newci)
 	}
 }
@@ -1052,7 +1063,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.heartbeatTimeout = 100
 	rf.electionTimeout = 150 + rand.Intn(200)
-	rf.maxNumSentEntries = 50
+	rf.maxNumSentEntries = 500
 
 	rf.applyCh = applyCh
 
@@ -1060,6 +1071,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// register persist field
 	labgob.Register(struct{}{})
 	labgob.Register(Stable{})
+	labgob.Register(guardCommand{})
 
 	// restart from persister
 	rf.readPersist(persister.ReadRaftState())
