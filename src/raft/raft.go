@@ -252,7 +252,7 @@ type Raft struct {
 	// handler
 	handleRequestVote        func(args *RequestVoteArgs, reply *RequestVoteReply)
 	handleRequestVoteReply   func(reply *RequestVoteReply)
-	handleAppendEntries      func(args *AppendEntriesArgs, reply *AppendEntriesReply)
+	// handleAppendEntries      func(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	handleAppendEntriesReply func(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	// cancel function for leader to quit rpc worker
@@ -601,7 +601,7 @@ func (rf *Raft) becomeFollower(term, votedFor int) {
 
 	rf.handleRequestVote = rf.commonHandleRequestVote
 	rf.handleRequestVoteReply = rf.emptyHandleRequestVoteReply
-	rf.handleAppendEntries = rf.followerHandleAppendEntries
+	// rf.handleAppendEntries = rf.followerHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.emptyHandleAppendEntriesReply
 }
 
@@ -614,7 +614,7 @@ func (rf *Raft) becomePreCandidate() {
 
 	rf.handleRequestVote = rf.commonHandleRequestVote
 	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
-	rf.handleAppendEntries = rf.candidateHandleAppendEntries
+	// rf.handleAppendEntries = rf.candidateHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.emptyHandleAppendEntriesReply
 
 	// clear votes log and vote self
@@ -656,7 +656,7 @@ func (rf *Raft) becomeCandidate() {
 
 	rf.handleRequestVote = rf.commonHandleRequestVote
 	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
-	rf.handleAppendEntries = rf.candidateHandleAppendEntries
+	// rf.handleAppendEntries = rf.candidateHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.emptyHandleAppendEntriesReply
 
 	// clear votes log and vote self
@@ -708,7 +708,7 @@ func (rf *Raft) becomeLeader() {
 
 	rf.handleRequestVote = rf.commonHandleRequestVote
 	rf.handleRequestVoteReply = rf.emptyHandleRequestVoteReply
-	rf.handleAppendEntries = rf.leaderHandleAppendEntries
+	// rf.handleAppendEntries = rf.leaderHandleAppendEntries
 	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 
 	rf.resetProgressTracker()
@@ -845,7 +845,7 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	return
 }
 
-func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.From = rf.me
 	reply.Term = rf.Term
 
@@ -853,55 +853,22 @@ func (rf *Raft) followerHandleAppendEntries(args *AppendEntriesArgs, reply *Appe
 		reply.Success = false
 		return
 	}
-
-	switch args.Type {
-	case HeartBeat:
+	if rf.Term < args.Term {
+		rf.becomeFollower(args.Term, args.From)
+	}
+	// rf.Term == args.Term
+	switch rf.role {
+	case Candidate:
+		fallthrough
+	case PreCandidate:
+		rf.becomeFollower(args.Term, args.From)
+	case Leader:
+		log.Fatalf("[error] Term %d has two leaders %d and %d", rf.Term, rf.me, args.From)
+	case Follower:
 		rf.electionElapsed = 0
-		if rf.Term < args.Term {
-			rf.Term = args.Term
-			rf.VotedFor = args.From
+		if args.Type == LogReplicate {
+			rf.tryAppendEntries(args, reply)
 		}
-	case LogReplicate:
-		rf.tryAppendEntries(args, reply)
-	}
-}
-
-// TODO: candidate and leader share the same logic, modify it
-func (rf *Raft) candidateHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.From = rf.me
-	reply.Term = rf.Term
-
-	if rf.Term > args.Term {
-		reply.Success = false
-		return
-	}
-
-	if rf.Term <= args.Term {
-		rf.becomeFollower(args.Term, args.From)
-	}
-
-	if args.Type == LogReplicate {
-		rf.tryAppendEntries(args, reply)
-	}
-}
-
-func (rf *Raft) leaderHandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.From = rf.me
-	reply.Term = rf.Term
-
-	if rf.Term > args.Term {
-		reply.Success = false
-		return
-	}
-
-	// TODO: what if leader find another leader at the same term
-	// maybe panic
-	if rf.Term <= args.Term {
-		rf.becomeFollower(args.Term, args.From)
-	}
-
-	if args.Type == LogReplicate {
-		rf.tryAppendEntries(args, reply)
 	}
 }
 
