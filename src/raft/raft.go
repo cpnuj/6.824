@@ -229,7 +229,7 @@ type Raft struct {
 
 	role int
 
-	rl    *raftLog
+	log   *raftLog
 	pt    progressTracer
 	votes map[int]struct{}
 
@@ -274,7 +274,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	stable := makeStable(rf.Term, rf.VotedFor, rf.rl.commitIndex, rf.rl.Entries())
+	stable := makeStable(rf.Term, rf.VotedFor, rf.log.commitIndex, rf.log.Entries())
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -313,8 +313,8 @@ func (rf *Raft) readPersist(data []byte) {
 		log.Fatal("readPersist: ", err)
 	}
 	rf.Term, rf.VotedFor = s.Term, s.VotedFor
-	rf.rl.SetEntries(s.Entries)
-	rf.rl.CommitTo(s.Commit)
+	rf.log.SetEntries(s.Entries)
+	rf.log.CommitTo(s.Commit)
 	DPrintf("[debug read] %d restore with stable status %v\n", rf.me, s)
 }
 
@@ -458,7 +458,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != Leader {
 		return 0, 0, false
 	} else {
-		index, term := rf.rl.LastIndex()+1, rf.Term
+		index, term := rf.log.LastIndex()+1, rf.Term
 		DPrintf("[debug prop] %d receive propose %v index %d term %d\n", rf.me, command, index, term)
 		rf.propose(command)
 		return index, term, true
@@ -539,8 +539,8 @@ func (rf *Raft) becomePreCandidate() {
 		args := &RequestVoteArgs{
 			Term:         rf.Term + 1,
 			CandidateID:  rf.me,
-			LastLogIndex: rf.rl.LastIndex(),
-			LastLogTerm:  rf.rl.LastTerm(),
+			LastLogIndex: rf.log.LastIndex(),
+			LastLogTerm:  rf.log.LastTerm(),
 			PreVote:      true,
 		}
 		go rf.sendAndHandleRequestVote(i, args, &RequestVoteReply{})
@@ -564,8 +564,8 @@ func (rf *Raft) becomeCandidate() {
 		args := &RequestVoteArgs{
 			Term:         rf.Term,
 			CandidateID:  rf.me,
-			LastLogIndex: rf.rl.LastIndex(),
-			LastLogTerm:  rf.rl.LastTerm(),
+			LastLogIndex: rf.log.LastIndex(),
+			LastLogTerm:  rf.log.LastTerm(),
 			PreVote:      false,
 		}
 		go rf.sendAndHandleRequestVote(i, args, &RequestVoteReply{})
@@ -576,12 +576,12 @@ func (rf *Raft) resetProgressTracker() {
 	pt := makeProgressTracer(len(rf.peers))
 	for i, _ := range pt {
 		if i == rf.me {
-			pt[i] = &progress{match: rf.rl.LastIndex()}
+			pt[i] = &progress{match: rf.log.LastIndex()}
 			continue
 		}
 		pt[i] = &progress{
 			match: 0,
-			next:  rf.rl.LastIndex() + 1,
+			next:  rf.log.LastIndex() + 1,
 		}
 		pt[i].BecomeProbe()
 	}
@@ -597,14 +597,14 @@ func (rf *Raft) broadcastHeartbeat() {
 		pg := rf.pt[i]
 		ni := pg.next
 		prevLogIndex := ni - 1
-		prevLogTerm := rf.rl.entries[prevLogIndex].Term
+		prevLogTerm := rf.log.entries[prevLogIndex].Term
 		// prepare entries
 		var ents []Entry
 		switch pg.state {
 		case StateProbe:
-			ents = rf.rl.Take(ni, 1)
+			ents = rf.log.Take(ni, 1)
 		case StateReplicate:
-			ents = rf.rl.Take(ni, rf.maxNumSentEntries)
+			ents = rf.log.Take(ni, rf.maxNumSentEntries)
 		}
 		args := &AppendEntriesArgs{
 			Term:         rf.Term,
@@ -612,7 +612,7 @@ func (rf *Raft) broadcastHeartbeat() {
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			Entries:      ents,
-			LeaderCommit: rf.rl.commitIndex,
+			LeaderCommit: rf.log.commitIndex,
 		}
 		go rf.sendAndHandleAppendEntries(i, args, &AppendEntriesReply{})
 	}
@@ -641,7 +641,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	}
 	// only check whether log is up-to-date for pre vote
 	if args.PreVote {
-		reply.VoteGranted = rf.rl.IsUpToDate(args.LastLogIndex, args.LastLogTerm)
+		reply.VoteGranted = rf.log.IsUpToDate(args.LastLogIndex, args.LastLogTerm)
 		return
 	}
 	// regular vote
@@ -663,7 +663,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		reply.RejectReason = "node has voted in this term"
 		return
 	}
-	if !rf.rl.IsUpToDate(args.LastLogIndex, args.LastLogTerm) {
+	if !rf.log.IsUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		reply.VoteGranted = false
 		reply.RejectReason = "node's log is newer"
 		return
@@ -706,10 +706,10 @@ func (rf *Raft) handleRequestVoteReply(args *RequestVoteArgs, reply *RequestVote
 // Append Entries RPC Handler
 //
 func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if !rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) {
-		hint := rf.rl.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
+	if !rf.log.Match(args.PrevLogIndex, args.PrevLogTerm) {
+		hint := rf.log.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
 		reply.HintIndex = hint
-		reply.HintTerm = rf.rl.entries[reply.HintIndex].Term
+		reply.HintTerm = rf.log.entries[reply.HintIndex].Term
 		reply.Success = false
 		return
 	}
@@ -719,21 +719,21 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	// find the conflict log pos to start append
 	// can avoid deleting the correct appended entries
 	for _, e := range args.Entries {
-		if !rf.rl.Match(bi, e.Term) {
+		if !rf.log.Match(bi, e.Term) {
 			break
 		}
 		bi++
 		ents = ents[1:]
 	}
 	if len(ents) > 0 {
-		if err := rf.rl.DeleteFrom(bi); err != nil {
+		if err := rf.log.DeleteFrom(bi); err != nil {
 			log.Fatal(err)
 		}
-		rf.rl.Append(ents)
+		rf.log.Append(ents)
 	}
-	if args.LeaderCommit > rf.rl.commitIndex {
-		oldci, newci := rf.rl.commitIndex, min(args.LeaderCommit, rf.rl.LastIndex())
-		if ok := rf.rl.CommitTo(newci); ok {
+	if args.LeaderCommit > rf.log.commitIndex {
+		oldci, newci := rf.log.commitIndex, min(args.LeaderCommit, rf.log.LastIndex())
+		if ok := rf.log.CommitTo(newci); ok {
 			DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
 			rf.apply(oldci+1, newci)
 		}
@@ -778,11 +778,11 @@ func insertionSort(sl []int) {
 }
 
 func (rf *Raft) apply(begin, end int) {
-	if end > rf.rl.LastIndex() {
-		log.Panicf("apply index %d greater than last index %d", end, rf.rl.LastIndex())
+	if end > rf.log.LastIndex() {
+		log.Panicf("apply index %d greater than last index %d", end, rf.log.LastIndex())
 	}
 	for i := begin; i <= end; i++ {
-		cmd := rf.rl.Entries()[i].Command
+		cmd := rf.log.Entries()[i].Command
 		am := ApplyMsg{
 			CommandValid: true,
 			Command:      cmd,
@@ -801,14 +801,14 @@ func (rf *Raft) tryCommit() {
 	insertionSort(arr)
 
 	pos := n - (n/2 + 1)
-	oldci, newci := rf.rl.commitIndex, max(arr[pos], rf.rl.commitIndex)
+	oldci, newci := rf.log.commitIndex, max(arr[pos], rf.log.commitIndex)
 
 	// cannot commit entries from previous term
-	if rf.rl.entries[newci].Term != rf.Term {
+	if rf.log.entries[newci].Term != rf.Term {
 		return
 	}
 
-	if ok := rf.rl.CommitTo(newci); ok {
+	if ok := rf.log.CommitTo(newci); ok {
 		DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
 		rf.apply(oldci+1, newci)
 	}
@@ -828,15 +828,17 @@ func (rf *Raft) handleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendE
 		if pg.state == StateProbe {
 			pg.BecomeReplicate()
 		}
-		// TODO: what if leader receive response for 2 rpc with the same entries
 		pg.match = max(pg.match, args.PrevLogIndex+len(args.Entries))
 		pg.next = pg.match + 1
 		rf.tryCommit()
 	} else {
+		if args.PrevLogIndex < pg.match {
+			return
+		}
 		if pg.state == StateReplicate {
 			pg.BecomeProbe()
 		}
-		matchHint := rf.rl.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
+		matchHint := rf.log.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
 		pg.DecrTo(matchHint)
 	}
 }
@@ -846,8 +848,8 @@ func (rf *Raft) handleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendE
 //
 func (rf *Raft) propose(command interface{}) {
 	ent := Entry{command, rf.Term}
-	rf.rl.Append([]Entry{ent})
-	rf.pt[rf.me].match = rf.rl.LastIndex()
+	rf.log.Append([]Entry{ent})
+	rf.pt[rf.me].match = rf.log.LastIndex()
 }
 
 func (rf *Raft) run() {
@@ -891,7 +893,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimeout = 300 + rand.Intn(200)
 	rf.maxNumSentEntries = 1000
 	rf.applyCh = applyCh
-	rf.rl = newRaftLog()
+	rf.log = newRaftLog()
 	// register persist field
 	labgob.Register(struct{}{})
 	labgob.Register(Stable{})
