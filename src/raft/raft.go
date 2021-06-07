@@ -4,7 +4,6 @@ import (
 	"../labgob"
 	"../labrpc"
 	"bytes"
-	"context"
 	"errors"
 	"log"
 	"math/rand"
@@ -210,77 +209,6 @@ func makeProgressTracer(n int) progressTracer {
 	return pt
 }
 
-type rpcMsgType int
-
-const (
-	MsgTypeAppendEntries rpcMsgType = iota
-	MsgTypeRequestVote
-)
-
-type rpcMsg struct {
-	msgType rpcMsgType // msg type
-	to      int
-	args    interface{}
-	reply   interface{}
-}
-
-func (rm *rpcMsg) Type() rpcMsgType {
-	return rm.msgType
-}
-
-//
-// rpc methods
-//
-const RpcChanSize = 1000
-
-func (rf *Raft) initRpcWorker() {
-	var ctx context.Context
-	ctx, rf.cancel = context.WithCancel(context.Background())
-	rf.rpcCh = make([]chan rpcMsg, len(rf.peers))
-	for i, _ := range rf.peers {
-		rf.rpcCh[i] = make(chan rpcMsg, RpcChanSize)
-		go rf.runRpcWorker(ctx, i)
-	}
-}
-
-func (rf *Raft) sendAndHandleRPC(rm rpcMsg, to int) {
-	switch rm.Type() {
-	case MsgTypeAppendEntries:
-		args := rm.args.(*AppendEntriesArgs)
-		reply := rm.reply.(*AppendEntriesReply)
-		if ok := rf.sendAppendEntries(to, args, reply); ok {
-			rf.mu.Lock()
-			rf.handleAppendEntriesReply(args, reply)
-			rf.persist()
-			rf.mu.Unlock()
-		}
-	case MsgTypeRequestVote:
-		args := rm.args.(*RequestVoteArgs)
-		reply := rm.reply.(*RequestVoteReply)
-		if ok := rf.sendRequestVote(to, args, reply); ok {
-			rf.mu.Lock()
-			rf.handleRequestVoteReply(args, reply)
-			rf.persist()
-			rf.mu.Unlock()
-		}
-	}
-}
-
-func (rf *Raft) runRpcWorker(ctx context.Context, server int) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case rm := <-rf.rpcCh[server]:
-			rf.sendAndHandleRPC(rm, server)
-		}
-	}
-}
-
-func (rf *Raft) send(rm rpcMsg, to int) {
-	rf.rpcCh[to] <- rm
-}
-
 //
 // A Go object implementing a single Raft peer.
 //
@@ -319,17 +247,6 @@ type Raft struct {
 
 	// max number of entries to be sent in one rpc
 	maxNumSentEntries int
-
-	// handler
-	// handleRequestVote      func(args *RequestVoteArgs, reply *RequestVoteReply)
-	handleRequestVoteReply func(args *RequestVoteArgs, reply *RequestVoteReply)
-	// handleAppendEntries      func(args *AppendEntriesArgs, reply *AppendEntriesReply)
-	handleAppendEntriesReply func(args *AppendEntriesArgs, reply *AppendEntriesReply)
-
-	// cancel function for leader to quit rpc worker
-	cancel context.CancelFunc
-
-	rpcCh []chan rpcMsg
 }
 
 // GetState return currentTerm and whether this server
@@ -471,20 +388,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-const (
-	HeartBeat = iota
-	LogReplicate
-)
+func (rf *Raft) sendAndHandleRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	if ok := rf.sendRequestVote(server, args, reply); ok {
+		rf.mu.Lock()
+		rf.handleRequestVoteReply(args, reply)
+		rf.persist()
+		rf.mu.Unlock()
+	}
+}
 
 // AppendEntries RPC
 type AppendEntriesArgs struct {
-	Type         int
 	Term         int
-	From         int
+	LeaderID     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	CommitIndex  int
 	Entries      []Entry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -505,6 +425,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if ok := rf.sendAppendEntries(server, args, reply); ok {
+		rf.mu.Lock()
+		rf.handleAppendEntriesReply(args, reply)
+		rf.persist()
+		rf.mu.Unlock()
+	}
 }
 
 // Start
@@ -552,7 +481,6 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	// DPrintf("node%d has been killed.\n", rf.me)
 	rf.done <- struct{}{}
-	rf.cancel()
 }
 
 func (rf *Raft) killed() bool {
@@ -579,7 +507,7 @@ func (rf *Raft) tickHeartbeat() {
 	rf.heartbeatElapsed++
 	if rf.heartbeatElapsed == rf.heartbeatTimeout {
 		rf.heartbeatElapsed = 0
-		rf.bcastHeartbeat()
+		rf.broadcastHeartbeat()
 	}
 }
 
@@ -591,14 +519,8 @@ func (rf *Raft) becomeFollower(term, votedFor int) {
 	rf.role = Follower
 	rf.Term = term
 	rf.VotedFor = votedFor
-
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
-
-	// rf.handleRequestVote = rf.commonHandleRequestVote
-	rf.handleRequestVoteReply = rf.emptyHandleRequestVoteReply
-	// rf.handleAppendEntries = rf.followerHandleAppendEntries
-	rf.handleAppendEntriesReply = rf.emptyHandleAppendEntriesReply
 }
 
 func (rf *Raft) becomePreCandidate() {
@@ -606,10 +528,6 @@ func (rf *Raft) becomePreCandidate() {
 	rf.role = PreCandidate
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
-	// rf.handleRequestVote = rf.commonHandleRequestVote
-	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
-	// rf.handleAppendEntries = rf.candidateHandleAppendEntries
-	rf.handleAppendEntriesReply = rf.emptyHandleAppendEntriesReply
 	// clear votes log and vote self
 	rf.votes = make(map[int]struct{})
 	rf.votes[rf.me] = struct{}{}
@@ -625,8 +543,7 @@ func (rf *Raft) becomePreCandidate() {
 			LastLogTerm:  rf.rl.LastTerm(),
 			PreVote:      true,
 		}
-		reply := &RequestVoteReply{}
-		rf.send(rpcMsg{msgType: MsgTypeRequestVote, args: args, reply: reply}, i)
+		go rf.sendAndHandleRequestVote(i, args, &RequestVoteReply{})
 	}
 }
 
@@ -636,10 +553,6 @@ func (rf *Raft) becomeCandidate() {
 	rf.VotedFor = rf.me
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
-	// rf.handleRequestVote = rf.commonHandleRequestVote
-	rf.handleRequestVoteReply = rf.candidateHandleRequestVoteReply
-	// rf.handleAppendEntries = rf.candidateHandleAppendEntries
-	rf.handleAppendEntriesReply = rf.emptyHandleAppendEntriesReply
 	// clear votes log and vote self
 	rf.votes = make(map[int]struct{})
 	rf.votes[rf.me] = struct{}{}
@@ -655,8 +568,7 @@ func (rf *Raft) becomeCandidate() {
 			LastLogTerm:  rf.rl.LastTerm(),
 			PreVote:      false,
 		}
-		reply := &RequestVoteReply{}
-		rf.send(rpcMsg{msgType: MsgTypeRequestVote, args: args, reply: reply}, i)
+		go rf.sendAndHandleRequestVote(i, args, &RequestVoteReply{})
 	}
 }
 
@@ -676,20 +588,13 @@ func (rf *Raft) resetProgressTracker() {
 	rf.pt = pt
 }
 
-func (rf *Raft) maybeSendLogReplicate(to int) {
-	// Check the replicate state of peer,
-	// send log if peer's log is behind
-	args := &AppendEntriesArgs{
-		Term:         rf.Term,
-		From:         rf.me,
-		CommitIndex:  rf.rl.commitIndex,
-	}
-	reply := &AppendEntriesReply{}
-	// no update, send heartbeat
-	pg := rf.pt[to]
-	if pg.match >= rf.rl.LastIndex() {
-		args.Type = HeartBeat
-	} else {
+func (rf *Raft) broadcastHeartbeat() {
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// no update, send heartbeat
+		pg := rf.pt[i]
 		ni := pg.next
 		prevLogIndex := ni - 1
 		prevLogTerm := rf.rl.entries[prevLogIndex].Term
@@ -701,23 +606,15 @@ func (rf *Raft) maybeSendLogReplicate(to int) {
 		case StateReplicate:
 			ents = rf.rl.Take(ni, rf.maxNumSentEntries)
 		}
-		args.Type = LogReplicate
-		args.PrevLogIndex = prevLogIndex
-		args.PrevLogTerm = prevLogTerm
-		args.Entries = ents
-	}
-	// DPrintf("[debug repl] %d send log replicate to %d prev log index %d prev log term %d commit index %d len ents %d\n",
-	//	rf.me, server, args.PrevLogIndex, args.PrevLogTerm, args.CommitIndex, len(args.Entries))
-	rf.send(rpcMsg{msgType: MsgTypeAppendEntries, args: args, reply: reply}, to)
-}
-
-func (rf *Raft) bcastHeartbeat() {
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
+		args := &AppendEntriesArgs{
+			Term:         rf.Term,
+			LeaderID:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      ents,
+			LeaderCommit: rf.rl.commitIndex,
 		}
-		// send first heartbeat
-		rf.maybeSendLogReplicate(i)
+		go rf.sendAndHandleAppendEntries(i, args, &AppendEntriesReply{})
 	}
 }
 
@@ -726,13 +623,9 @@ func (rf *Raft) becomeLeader() {
 	rf.role = Leader
 	rf.tick = rf.tickHeartbeat
 	rf.heartbeatElapsed = 0
-	//rf.handleRequestVote = rf.commonHandleRequestVote
-	rf.handleRequestVoteReply = rf.emptyHandleRequestVoteReply
-	// rf.handleAppendEntries = rf.leaderHandleAppendEntries
-	rf.handleAppendEntriesReply = rf.leaderHandleAppendEntriesReply
 	rf.resetProgressTracker()
 	// send append entries rpc
-	rf.bcastHeartbeat()
+	rf.broadcastHeartbeat()
 }
 
 //
@@ -783,11 +676,10 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 //
 // Request Vote RPC Reply Handler
 //
-func (rf *Raft) emptyHandleRequestVoteReply(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// do nothing
-}
-
-func (rf *Raft) candidateHandleRequestVoteReply(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) handleRequestVoteReply(args *RequestVoteArgs, reply *RequestVoteReply) {
+	if rf.role != Candidate && rf.role != PreCandidate {
+		return
+	}
 	if reply.Term > rf.Term {
 		rf.becomeFollower(reply.Term, NonVote)
 		return
@@ -813,40 +705,34 @@ func (rf *Raft) candidateHandleRequestVoteReply(args *RequestVoteArgs, reply *Re
 //
 // Append Entries RPC Handler
 //
-func (rf *Raft) maybeUpdateCommit(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-}
-
 func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	switch args.Type {
-	case HeartBeat:
-	case LogReplicate:
-		if !rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) {
-			hint := rf.rl.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
-			reply.HintIndex = hint
-			reply.HintTerm = rf.rl.entries[reply.HintIndex].Term
-			reply.Success = false
-			return
+	if !rf.rl.Match(args.PrevLogIndex, args.PrevLogTerm) {
+		hint := rf.rl.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
+		reply.HintIndex = hint
+		reply.HintTerm = rf.rl.entries[reply.HintIndex].Term
+		reply.Success = false
+		return
+	}
+	reply.Success = true
+	ents := args.Entries
+	bi := args.PrevLogIndex + 1
+	// find the conflict log pos to start append
+	// can avoid deleting the correct appended entries
+	for _, e := range args.Entries {
+		if !rf.rl.Match(bi, e.Term) {
+			break
 		}
-		ents := args.Entries
-		bi := args.PrevLogIndex + 1
-		// find the conflict log pos to start append
-		// can avoid deleting the correct appended entries
-		for _, e := range args.Entries {
-			if !rf.rl.Match(bi, e.Term) {
-				break
-			}
-			bi++
-			ents = ents[1:]
-		}
+		bi++
+		ents = ents[1:]
+	}
+	if len(ents) > 0 {
 		if err := rf.rl.DeleteFrom(bi); err != nil {
-			DPrintf("[debug err ] %d delete from %d commit index %d\n", rf.me, bi, rf.rl.commitIndex)
 			log.Fatal(err)
 		}
 		rf.rl.Append(ents)
-		reply.Success = true
 	}
-	if args.CommitIndex > rf.rl.commitIndex {
-		oldci, newci := rf.rl.commitIndex, min(args.CommitIndex, rf.rl.LastIndex())
+	if args.LeaderCommit > rf.rl.commitIndex {
+		oldci, newci := rf.rl.commitIndex, min(args.LeaderCommit, rf.rl.LastIndex())
 		if ok := rf.rl.CommitTo(newci); ok {
 			DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
 			rf.apply(oldci+1, newci)
@@ -863,7 +749,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		return
 	}
 	if rf.Term < args.Term {
-		rf.becomeFollower(args.Term, args.From)
+		rf.becomeFollower(args.Term, args.LeaderID)
 	}
 	// rf.Term == args.Term
 	switch rf.role {
@@ -872,9 +758,9 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	case Candidate:
 		fallthrough
 	case PreCandidate:
-		rf.becomeFollower(args.Term, args.From)
+		rf.becomeFollower(args.Term, args.LeaderID)
 	case Leader:
-		log.Fatalf("[error] Term %d has two leaders %d and %d", rf.Term, rf.me, args.From)
+		log.Fatalf("[error] Term %d has two leaders %d and %d", rf.Term, rf.me, args.LeaderID)
 	}
 	rf.tryAppendEntries(args, reply)
 }
@@ -928,23 +814,15 @@ func (rf *Raft) tryCommit() {
 	}
 }
 
-func (rf *Raft) emptyHandleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// empty
-}
-
-func (rf *Raft) leaderHandleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) handleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.role != Leader {
+		return
+	}
 	from := reply.From
-
 	if reply.Term > rf.Term {
 		rf.becomeFollower(reply.Term, NonVote)
 		return
 	}
-
-	// TODO: use another handler for heartbeat?
-	if args.Type == HeartBeat {
-		return
-	}
-
 	pg := rf.pt[from]
 	if reply.Success {
 		if pg.state == StateProbe {
@@ -1009,24 +887,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.done = make(chan struct{})
 
 	// Your initialization code here (2A, 2B, 2C).
-
 	rf.heartbeatTimeout = 100
-	rf.electionTimeout = 150 + rand.Intn(200)
-	rf.maxNumSentEntries = 500
-
+	rf.electionTimeout = 300 + rand.Intn(200)
+	rf.maxNumSentEntries = 1000
 	rf.applyCh = applyCh
-
 	rf.rl = newRaftLog()
 	// register persist field
 	labgob.Register(struct{}{})
 	labgob.Register(Stable{})
-
 	// restart from persister
 	rf.readPersist(persister.ReadRaftState())
-
 	rf.becomeFollower(rf.Term, rf.VotedFor)
-	rf.initRpcWorker()
 	go rf.run()
-
 	return rf
 }
