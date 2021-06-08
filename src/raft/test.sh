@@ -1,9 +1,9 @@
 #!/bin/zsh
 
 echo "Begin "$1
-for i in {1..20}
+for i in {1..10}
 do
-echo 'test round '$i' fails: '
-go test -run $1 | grep 'FAIL' | wc -l
+echo 'test round '$i': '
+go test -run $1
 done
 
