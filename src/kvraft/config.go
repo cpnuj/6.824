@@ -69,7 +69,9 @@ func (cfg *config) checkTimeout() {
 func (cfg *config) cleanup() {
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
+	DPrintf("clean up ..\n")
 	for i := 0; i < len(cfg.kvservers); i++ {
+		DPrintf("clean %d ..\n", i)
 		if cfg.kvservers[i] != nil {
 			cfg.kvservers[i].Kill()
 		}

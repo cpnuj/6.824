@@ -8,18 +8,27 @@ const (
 
 type Err string
 
+const (
+	KeyNotExist Err = "key not exist"
+	NotLead         = "is not lead"
+	TimeOut					= "timeout"
+	NoErr           = "success"
+	Fail            = "fail"
+)
+
 // Put or Append
 type PutAppendArgs struct {
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   string
+	Value string
+	Op    string // "Put" or "Append"
+	Seq   int
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err  Err
 }
 
 type GetArgs struct {
