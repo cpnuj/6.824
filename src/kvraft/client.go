@@ -45,21 +45,20 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := &GetArgs{Key: key}
+	reply := &GetReply{}
 	DPrintf("[debug app] get %s\n", key)
-	for i, _ := range ck.servers {
-		reply := &GetReply{}
-		if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
+	for ; ; ck.leadCache = (ck.leadCache + 1) % len(ck.servers) {
+	  ok := ck.servers[ck.leadCache].Call("KVServer.Get", args, reply)
+	  if ok {
 			switch reply.Err {
+			case NotLead:
+			case Fail:
+				return ""
 			case NoErr:
 				return reply.Value
-			case NotLead:
-				continue
-			case KeyNotExist:
-				break
 			}
 		}
 	}
-	return ""
 }
 
 //
@@ -85,8 +84,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if ok {
 			return
 		}
-		// slow down request
-		time.Sleep(time.Second)
 	}
 }
 
@@ -106,8 +103,10 @@ func (ck *Clerk) sendPutAppendAndWait(to int, args *PutAppendArgs, reply *PutApp
 
 	select {
 	case reply := <-ch:
+		DPrintf("[debug app] reply from %d err %s\n", to, reply.Err)
 		return reply.Err == NoErr
 	case <-time.After(time.Second):
+		DPrintf("[debug app] request to %d timeout\n", to)
 		return false
 	}
 }

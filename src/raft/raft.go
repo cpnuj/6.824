@@ -234,17 +234,14 @@ type Raft struct {
 	votes map[int]struct{}
 
 	applyCh chan ApplyMsg
-	done    chan struct{}
 
 	ticker *time.Ticker
 	tick   func()
 
 	electionElapsed  int
 	heartbeatElapsed int
-
 	electionTimeout  int
 	heartbeatTimeout int
-
 	// max number of entries to be sent in one rpc
 	maxNumSentEntries int
 }
@@ -315,7 +312,6 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.Term, rf.VotedFor = s.Term, s.VotedFor
 	rf.log.SetEntries(s.Entries)
 	rf.log.CommitTo(s.Commit)
-	DPrintf("[debug read] %d restore with stable status %v\n", rf.me, s)
 }
 
 // RequestVoteArgs
@@ -423,6 +419,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+/*	DPrintf("[debug raft] %d send app prev index %d term %d len %3d to %d\n",
+		rf.me, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), server)
+*/
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -479,8 +478,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	// DPrintf("node%d has been killed.\n", rf.me)
-	rf.done <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
@@ -624,7 +621,6 @@ func (rf *Raft) becomeLeader() {
 	rf.tick = rf.tickHeartbeat
 	rf.heartbeatElapsed = 0
 	rf.resetProgressTracker()
-	// send append entries rpc
 	rf.broadcastHeartbeat()
 }
 
@@ -657,7 +653,6 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		// since follower would not be reset in the previous process
 		rf.VotedFor = NonVote
 	}
-	DPrintf("[debug vote] %d term % d voted for %d receive request vote from %d %v\n", rf.me, rf.Term, rf.VotedFor, args.CandidateID, args)
 	if rf.VotedFor != NonVote {
 		reply.VoteGranted = false
 		reply.RejectReason = "node has voted in this term"
@@ -853,18 +848,12 @@ func (rf *Raft) propose(command interface{}) {
 }
 
 func (rf *Raft) run() {
-	rf.ticker = time.NewTicker(time.Millisecond)
-	defer rf.ticker.Stop()
-	for {
-		select {
-		case <-rf.ticker.C:
-			rf.mu.Lock()
-			rf.tick()
-			rf.persist()
-			rf.mu.Unlock()
-		case <-rf.done:
-			return
-		}
+	for !rf.killed() {
+		time.Sleep(time.Millisecond)
+		rf.mu.Lock()
+		rf.tick()
+		rf.persist()
+		rf.mu.Unlock()
 	}
 }
 

@@ -58,25 +58,23 @@ type KVServer struct {
 
 	// applied is a condition variable to record
 	// the current applied command index
-	applied int
 	c       *sync.Cond
-	log  []Op
-	data map[string]string
-
-	done chan struct{}
+	applied int
+	data    map[string]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	if _, isLead := kv.rf.GetState(); isLead {
+	_, isLead := kv.rf.GetState()
+	if isLead {
+		kv.mu.Lock()
 		if value, ok := kv.data[args.Key]; ok {
 			reply.Value = value
 			reply.Err = NoErr
 		} else {
 			reply.Err = Fail
 		}
+		kv.mu.Unlock()
 	} else {
 		reply.Err = NotLead
 	}
@@ -95,6 +93,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.c.Wait()
 	}
 	kv.c.L.Unlock()
+	if _, isLead := kv.rf.GetState(); !isLead {
+		reply.Err = NotLead
+	} else {
+		reply.Err = NoErr
+	}
 }
 
 func (kv *KVServer) processApplyMsg(am raft.ApplyMsg) {
@@ -115,13 +118,9 @@ func (kv *KVServer) processApplyMsg(am raft.ApplyMsg) {
 }
 
 func (kv *KVServer) run() {
-	for {
-		select {
-		case <-kv.done:
-			return
-		case am := <-kv.applyCh:
-			kv.processApplyMsg(am)
-		}
+	for !kv.killed() {
+		am := <-kv.applyCh
+		kv.processApplyMsg(am)
 	}
 }
 
@@ -140,7 +139,6 @@ func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	DPrintf("[debug kill] server %d got killed\n", kv.me)
-	kv.done <- struct {}{}
 }
 
 func (kv *KVServer) killed() bool {
