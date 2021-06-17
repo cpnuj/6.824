@@ -65,8 +65,9 @@ const NonVote = -1
 // raft log implementation
 //
 type raftLog struct {
-	commitIndex int
-	entries     []Entry
+	commitIndex  int
+	appliedIndex int
+	entries      []Entry
 }
 
 func (rl *raftLog) Append(ents []Entry) {
@@ -160,14 +161,16 @@ type Stable struct {
 	Term     int
 	VotedFor int
 	Commit   int
+	Applied  int
 	Entries  []Entry
 }
 
-func makeStable(term, votedFor, commit int, entries []Entry) Stable {
+func makeStable(term, votedFor, commit, applied int, entries []Entry) Stable {
 	return Stable{
 		Term:     term,
 		VotedFor: votedFor,
 		Commit:   commit,
+		Applied:  applied,
 		Entries:  entries,
 	}
 }
@@ -271,7 +274,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	stable := makeStable(rf.Term, rf.VotedFor, rf.log.commitIndex, rf.log.Entries())
+	stable := makeStable(rf.Term, rf.VotedFor, rf.log.commitIndex, rf.log.appliedIndex, rf.log.Entries())
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -312,6 +315,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.Term, rf.VotedFor = s.Term, s.VotedFor
 	rf.log.SetEntries(s.Entries)
 	rf.log.CommitTo(s.Commit)
+	rf.apply(1, s.Commit)
 }
 
 // RequestVoteArgs
@@ -785,6 +789,7 @@ func (rf *Raft) apply(begin, end int) {
 		}
 		rf.applyCh <- am
 	}
+	rf.log.appliedIndex = end
 }
 
 func (rf *Raft) tryCommit() {
@@ -875,7 +880,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.done = make(chan struct{})
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeatTimeout = 100
