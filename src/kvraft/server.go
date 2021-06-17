@@ -9,29 +9,13 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		log.Printf(format, a...)
 	}
 	return
-}
-
-func min(x, y int) int {
-	if x <= y {
-		return x
-	} else {
-		return y
-	}
-}
-
-func max(x, y int) int {
-	if x >= y {
-		return x
-	} else {
-		return y
-	}
 }
 
 type Op struct {
@@ -41,7 +25,7 @@ type Op struct {
 	Type     string // Put or Append
 	Key      string
 	Value    string
-	ClientId int
+	ClientId int64
 	Seq      int
 }
 
@@ -60,29 +44,31 @@ type KVServer struct {
 	// the current applied command index
 	c       *sync.Cond
 	applied int
+	log     map[int]Op    // track index -> op
+	cliseq  map[int64]int // track client's max seq
 	data    map[string]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	_, isLead := kv.rf.GetState()
-	if isLead {
-		kv.mu.Lock()
-		if value, ok := kv.data[args.Key]; ok {
-			reply.Value = value
-			reply.Err = NoErr
-		} else {
-			reply.Err = Fail
-		}
-		kv.mu.Unlock()
-	} else {
+	if _, isLead := kv.rf.GetState(); !isLead {
 		reply.Err = NotLead
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if value, ok := kv.data[args.Key]; ok {
+		reply.Value = value
+		reply.Err = NoErr
+	} else {
+		reply.Err = Fail
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	index, _, ok := kv.rf.Start(Op{Key: args.Key, Value: args.Value, Type: args.Op, Seq: args.Seq})
+	index, _, ok := kv.rf.Start(Op{Key: args.Key, Value: args.Value,
+		Type: args.Op, ClientId: args.ClientID, Seq: args.Seq})
 	if !ok {
 		reply.Err = NotLead
 		return
@@ -93,8 +79,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.c.Wait()
 	}
 	kv.c.L.Unlock()
-	if _, isLead := kv.rf.GetState(); !isLead {
-		reply.Err = NotLead
+
+	kv.mu.Lock()
+	aop := kv.log[index]
+	kv.mu.Unlock()
+
+	cid, seq := aop.ClientId, aop.Seq
+	_, isLead := kv.rf.GetState()
+	if !isLead || cid != args.ClientID || seq != args.Seq {
+		reply.Err = Fail
 	} else {
 		reply.Err = NoErr
 	}
@@ -102,17 +95,35 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) processApplyMsg(am raft.ApplyMsg) {
 	kv.mu.Lock()
-	cmd := am.Command.(Op)
-	switch cmd.Type {
-	case "Put":
-		kv.data[cmd.Key] = cmd.Value
-	case "Append":
-		kv.data[cmd.Key] = kv.data[cmd.Key] + cmd.Value
+	op := am.Command.(Op)
+
+	if _, ok := kv.cliseq[op.ClientId]; !ok {
+		kv.cliseq[op.ClientId] = -1
+	}
+
+	if op.Seq > kv.cliseq[op.ClientId] {
+		switch op.Type {
+		case "Put":
+			kv.data[op.Key] = op.Value
+		case "Append":
+			kv.data[op.Key] = kv.data[op.Key] + op.Value
+		}
+		kv.cliseq[op.ClientId] = op.Seq
 	}
 	kv.mu.Unlock()
+
 	// update applied index
 	kv.c.L.Lock()
-	kv.applied = max(am.CommandIndex, kv.applied)
+	if am.CommandIndex <= kv.applied {
+		log.Fatalf("%d attempt to apply smaller index %d applied index: %d",
+			kv.me, am.CommandIndex, kv.applied)
+	}
+	kv.applied = am.CommandIndex
+
+	kv.mu.Lock()
+	kv.log[am.CommandIndex] = op
+	kv.mu.Unlock()
+
 	kv.c.Broadcast()
 	kv.c.L.Unlock()
 }
@@ -171,13 +182,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	// condition lock
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
 	kv.c = sync.NewCond(&sync.Mutex{})
+	kv.log = make(map[int]Op)
+	kv.cliseq = make(map[int64]int)
 	kv.data = make(map[string]string)
+	kv.applyCh = make(chan raft.ApplyMsg)
 	go kv.run()
+	// We should run server goroutine first, then the
+	// initialization of raft can apply the previous log
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	return kv
 }

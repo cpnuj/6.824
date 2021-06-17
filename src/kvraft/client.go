@@ -4,16 +4,15 @@ import (
 	"../labrpc"
 	"crypto/rand"
 	"math/big"
-	"sync"
 	"time"
 )
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	sync.Mutex
-	leadCache int
+	id				int64
 	seq				int
+	leadCache int
 }
 
 func nrand() int64 {
@@ -27,6 +26,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	// gen client id, not guaranteed to be global unique
+	ck.id = nrand() + time.Now().Unix()
+	ck.seq = 0
+	DPrintf("[debug cli] new clerk id %d\n", ck.id)
 	return ck
 }
 
@@ -74,10 +77,9 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := &PutAppendArgs{Key: key, Value: value, Op: op}
-	ck.Lock()
+	args.ClientID = ck.id
 	args.Seq = ck.seq
 	ck.seq++
-	ck.Unlock()
 	reply := &PutAppendReply{}
 	for ; ; ck.leadCache = (ck.leadCache + 1) % len(ck.servers) {
 		ok := ck.sendPutAppendAndWait(ck.leadCache, args, reply)
