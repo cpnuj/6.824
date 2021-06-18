@@ -4,7 +4,6 @@ import (
 	"../labgob"
 	"../labrpc"
 	"bytes"
-	"errors"
 	"log"
 	"math/rand"
 	"sync"
@@ -65,32 +64,56 @@ const NonVote = -1
 // raft log implementation
 //
 type raftLog struct {
-	commitIndex  int
-	appliedIndex int
-	entries      []Entry
-}
-
-func (rl *raftLog) Append(ents []Entry) {
-	rl.entries = append(rl.entries, ents...)
+	off     int
+	commit  int
+	apply   int
+	entries []Entry
 }
 
 func (rl *raftLog) SetEntries(ents []Entry) {
 	rl.entries = ents
 }
 
-func (rl *raftLog) DeleteFrom(from int) error {
-	if from <= rl.commitIndex {
-		return errors.New("delete from invalid index")
+func (rl *raftLog) Append(ents []Entry) {
+	rl.entries = append(rl.entries, ents...)
+}
+
+func (rl *raftLog) DeleteFrom(from int) {
+	if from <= rl.commit {
+		log.Fatalf("delete from invalid index")
 	}
 	rl.entries = rl.entries[:from]
-	return nil
+}
+
+func (rl *raftLog) Entry(i int) Entry {
+  return rl.entries[i - rl.off]
+}
+
+func (rl *raftLog) Entries() []Entry {
+	return rl.entries
+}
+
+func (rl *raftLog) CommitIndex() int {
+	return rl.commit
 }
 
 func (rl *raftLog) CommitTo(ci int) bool {
-	if ci <= rl.commitIndex {
+	if ci <= rl.commit {
 		return false
 	}
-	rl.commitIndex = ci
+	rl.commit = ci
+	return true
+}
+
+func (rl *raftLog) ApplyIndex() int {
+	return rl.apply
+}
+
+func (rl *raftLog) ApplyTo(ai int) bool {
+	if ai <= rl.apply {
+		return false
+	}
+	rl.apply = ai
 	return true
 }
 
@@ -106,10 +129,9 @@ func (rl *raftLog) IsUpToDate(index, term int) bool {
 	if term < rl.LastTerm() {
 		return false
 	}
-	if term == rl.LastTerm() {
-		if index < rl.LastIndex() {
-			return false
-		}
+	if term == rl.LastTerm() &&
+		index < rl.LastIndex() {
+		return false
 	}
 	return true
 }
@@ -124,7 +146,7 @@ func (rl *raftLog) Take(begin, n int) []Entry {
 }
 
 // find the possible match index of two logs
-func (rl *raftLog) MaybeMatchAt(term, index int) int {
+func (rl *raftLog) FindHint(term, index int) int {
 	i, li := index, rl.LastIndex()
 	if index > li {
 		i = li
@@ -138,20 +160,15 @@ func (rl *raftLog) MaybeMatchAt(term, index int) int {
 }
 
 func (rl *raftLog) LastIndex() int {
-	return len(rl.entries) - 1
+	return rl.off + len(rl.entries) - 1
 }
 
 func (rl *raftLog) LastTerm() int {
-	return rl.entries[rl.LastIndex()].Term
-}
-
-func (rl *raftLog) Entries() []Entry {
-	return rl.entries
+	return rl.entries[len(rl.entries)-1].Term
 }
 
 func newRaftLog() *raftLog {
 	rl := &raftLog{}
-	rl.commitIndex = 0
 	rl.entries = make([]Entry, 1)
 	rl.entries[0] = Entry{struct{}{}, 0}
 	return rl
@@ -165,13 +182,13 @@ type Stable struct {
 	Entries  []Entry
 }
 
-func makeStable(term, votedFor, commit, applied int, entries []Entry) Stable {
+func (rf *Raft) makeStable() Stable {
 	return Stable{
-		Term:     term,
-		VotedFor: votedFor,
-		Commit:   commit,
-		Applied:  applied,
-		Entries:  entries,
+		Term:     rf.Term,
+		VotedFor: rf.VotedFor,
+		Commit:   rf.log.CommitIndex(),
+		Applied:  rf.log.ApplyIndex(),
+		Entries:  rf.log.Entries(),
 	}
 }
 
@@ -188,19 +205,8 @@ type progress struct {
 const (
 	StateProbe = iota
 	StateReplicate
+	StateSnapshot
 )
-
-func (pg *progress) BecomeProbe() {
-	pg.state = StateProbe
-}
-
-func (pg *progress) BecomeReplicate() {
-	pg.state = StateReplicate
-}
-
-func (pg *progress) DecrTo(matchHint int) {
-	pg.next = max(min(pg.next-1, matchHint+1), 1)
-}
 
 //
 // progress tracker for leader to trace the progress of log replication
@@ -229,24 +235,20 @@ type Raft struct {
 	// state need to persist
 	Term     int
 	VotedFor int
+	log      *raftLog
+	snapshot *raftSnapshot
 
-	role int
-
-	log   *raftLog
-	pt    progressTracer
-	votes map[int]struct{}
-
+	role    int
+	pt      progressTracer
+	votes   map[int]struct{}
 	applyCh chan ApplyMsg
+	tick    func()
 
-	ticker *time.Ticker
-	tick   func()
-
-	electionElapsed  int
-	heartbeatElapsed int
-	electionTimeout  int
-	heartbeatTimeout int
-	// max number of entries to be sent in one rpc
-	maxNumSentEntries int
+	electionElapsed   int
+	heartbeatElapsed  int
+	electionTimeout   int
+	heartbeatTimeout  int
+	maxNumSentEntries int // max number of entries to be sent in one rpc
 }
 
 // GetState return currentTerm and whether this server
@@ -274,7 +276,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	stable := makeStable(rf.Term, rf.VotedFor, rf.log.commitIndex, rf.log.appliedIndex, rf.log.Entries())
+	stable := rf.makeStable()
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -423,9 +425,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-/*	DPrintf("[debug raft] %d send app prev index %d term %d len %3d to %d\n",
-		rf.me, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), server)
-*/
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -455,7 +454,7 @@ func (rf *Raft) CheckQuorum() bool {
 		pg := rf.pt[i]
 		ni := pg.next
 		prevLogIndex := ni - 1
-		prevLogTerm := rf.log.entries[prevLogIndex].Term
+		prevLogTerm := rf.log.Entry(prevLogIndex).Term
 		// prepare entries
 		var ents []Entry
 		switch pg.state {
@@ -470,7 +469,7 @@ func (rf *Raft) CheckQuorum() bool {
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			Entries:      ents,
-			LeaderCommit: rf.log.commitIndex,
+			LeaderCommit: rf.log.CommitIndex(),
 		}
 		go func(i int) {
 			reply := &AppendEntriesReply{}
@@ -484,16 +483,38 @@ func (rf *Raft) CheckQuorum() bool {
 	for {
 		select {
 		case ok := <-resp:
-		  if ok {
+			if ok {
 				ack++
 			}
-			if ack >= len(rf.peers)/2 + 1 {
+			if ack >= len(rf.peers)/2+1 {
 				return true
 			}
 		case <-t.C:
 			return false
 		}
 	}
+}
+
+type raftSnapshot struct {
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	data              []byte
+}
+
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+  if index > rf.snapshot.lastIncludedIndex {
+  	rf.snapshot.lastIncludedIndex = index
+  	rf.snapshot.lastIncludedTerm = rf.log.entries[index].Term
+  	rf.snapshot.data = snapshot
+  	// compact log
+  	rf.log.off = index+1
+  	rf.log.entries = rf.log.entries[rf.log.off:]
+	}
+}
+
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int,
+	lastIncludedIndex int, snapshot []byte) bool {
+	return true
 }
 
 // Start
@@ -641,7 +662,7 @@ func (rf *Raft) resetProgressTracker() {
 			match: 0,
 			next:  rf.log.LastIndex() + 1,
 		}
-		pt[i].BecomeProbe()
+		pt[i].state = StateProbe
 	}
 	rf.pt = pt
 }
@@ -670,7 +691,7 @@ func (rf *Raft) broadcastHeartbeat() {
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			Entries:      ents,
-			LeaderCommit: rf.log.commitIndex,
+			LeaderCommit: rf.log.CommitIndex(),
 		}
 		go rf.sendAndHandleAppendEntries(i, args, &AppendEntriesReply{})
 	}
@@ -761,9 +782,33 @@ func (rf *Raft) handleRequestVoteReply(args *RequestVoteArgs, reply *RequestVote
 //
 // Append Entries RPC Handler
 //
-func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.From = rf.me
+	reply.Term = rf.Term
+
+	if rf.Term > args.Term {
+		reply.Success = false
+		return
+	}
+	if rf.Term < args.Term {
+		rf.becomeFollower(args.Term, args.LeaderID)
+	}
+	// now rf.Term == args.Term
+	switch rf.role {
+	case Follower:
+		rf.electionElapsed = 0
+	case Candidate:
+		fallthrough
+	case PreCandidate:
+		rf.becomeFollower(args.Term, args.LeaderID)
+	case Leader:
+		log.Fatalf("[error] Term %d has two leaders %d and %d",
+			rf.Term, rf.me, args.LeaderID)
+	}
+
+	// check match
 	if !rf.log.Match(args.PrevLogIndex, args.PrevLogTerm) {
-		hint := rf.log.MaybeMatchAt(args.PrevLogTerm, args.PrevLogIndex)
+		hint := rf.log.FindHint(args.PrevLogTerm, args.PrevLogIndex)
 		reply.HintIndex = hint
 		reply.HintTerm = rf.log.entries[reply.HintIndex].Term
 		reply.Success = false
@@ -782,43 +827,16 @@ func (rf *Raft) tryAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		ents = ents[1:]
 	}
 	if len(ents) > 0 {
-		if err := rf.log.DeleteFrom(bi); err != nil {
-			log.Fatal(err)
-		}
+		rf.log.DeleteFrom(bi)
 		rf.log.Append(ents)
 	}
-	if args.LeaderCommit > rf.log.commitIndex {
-		oldci, newci := rf.log.commitIndex, min(args.LeaderCommit, rf.log.LastIndex())
+	if args.LeaderCommit > rf.log.CommitIndex() {
+		oldci, newci := rf.log.CommitIndex(), min(args.LeaderCommit, rf.log.LastIndex())
 		if ok := rf.log.CommitTo(newci); ok {
 			DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
 			rf.apply(oldci+1, newci)
 		}
 	}
-}
-
-func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.From = rf.me
-	reply.Term = rf.Term
-
-	if rf.Term > args.Term {
-		reply.Success = false
-		return
-	}
-	if rf.Term < args.Term {
-		rf.becomeFollower(args.Term, args.LeaderID)
-	}
-	// rf.Term == args.Term
-	switch rf.role {
-	case Follower:
-		rf.electionElapsed = 0
-	case Candidate:
-		fallthrough
-	case PreCandidate:
-		rf.becomeFollower(args.Term, args.LeaderID)
-	case Leader:
-		log.Fatalf("[error] Term %d has two leaders %d and %d", rf.Term, rf.me, args.LeaderID)
-	}
-	rf.tryAppendEntries(args, reply)
 }
 
 //
@@ -838,7 +856,7 @@ func (rf *Raft) apply(begin, end int) {
 		log.Panicf("apply index %d greater than last index %d", end, rf.log.LastIndex())
 	}
 	for i := begin; i <= end; i++ {
-		cmd := rf.log.Entries()[i].Command
+		cmd := rf.log.entries[i].Command
 		am := ApplyMsg{
 			CommandValid: true,
 			Command:      cmd,
@@ -846,7 +864,7 @@ func (rf *Raft) apply(begin, end int) {
 		}
 		rf.applyCh <- am
 	}
-	rf.log.appliedIndex = end
+	rf.log.ApplyTo(end)
 }
 
 func (rf *Raft) tryCommit() {
@@ -858,15 +876,12 @@ func (rf *Raft) tryCommit() {
 	insertionSort(arr)
 
 	pos := n - (n/2 + 1)
-	oldci, newci := rf.log.commitIndex, max(arr[pos], rf.log.commitIndex)
+	oldci := rf.log.CommitIndex()
+	newci := max(arr[pos], oldci)
 
 	// cannot commit entries from previous term
-	if rf.log.entries[newci].Term != rf.Term {
-		return
-	}
-
-	if ok := rf.log.CommitTo(newci); ok {
-		DPrintf("[debug comm] %d commit to %d\n", rf.me, newci)
+	if rf.log.Entry(newci).Term == rf.Term {
+	  rf.log.CommitTo(newci)
 		rf.apply(oldci+1, newci)
 	}
 }
@@ -883,7 +898,7 @@ func (rf *Raft) handleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendE
 	pg := rf.pt[from]
 	if reply.Success {
 		if pg.state == StateProbe {
-			pg.BecomeReplicate()
+		  pg.state = StateReplicate
 		}
 		pg.match = max(pg.match, args.PrevLogIndex+len(args.Entries))
 		pg.next = pg.match + 1
@@ -893,10 +908,10 @@ func (rf *Raft) handleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendE
 			return
 		}
 		if pg.state == StateReplicate {
-			pg.BecomeProbe()
+			pg.state = StateProbe
 		}
-		matchHint := rf.log.MaybeMatchAt(reply.HintTerm, reply.HintIndex)
-		pg.DecrTo(matchHint)
+		matchHint := rf.log.FindHint(reply.HintTerm, reply.HintIndex)
+		pg.next = max(min(pg.next-1, matchHint+1), 1)
 	}
 }
 
