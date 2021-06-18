@@ -430,12 +430,69 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if ok := rf.sendAppendEntries(server, args, reply); ok {
+func (rf *Raft) sendAndHandleAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) (ok bool) {
+	if ok = rf.sendAppendEntries(server, args, reply); ok {
 		rf.mu.Lock()
 		rf.handleAppendEntriesReply(args, reply)
 		rf.persist()
 		rf.mu.Unlock()
+	}
+	return ok
+}
+
+func (rf *Raft) CheckQuorum() bool {
+	if _, isLead := rf.GetState(); !isLead {
+		return false
+	}
+	// send heartbeat
+	// TODO: reduce duplicate code
+	resp := make(chan bool, len(rf.peers))
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// no update, send heartbeat
+		pg := rf.pt[i]
+		ni := pg.next
+		prevLogIndex := ni - 1
+		prevLogTerm := rf.log.entries[prevLogIndex].Term
+		// prepare entries
+		var ents []Entry
+		switch pg.state {
+		case StateProbe:
+			ents = rf.log.Take(ni, 1)
+		case StateReplicate:
+			ents = rf.log.Take(ni, rf.maxNumSentEntries)
+		}
+		args := &AppendEntriesArgs{
+			Term:         rf.Term,
+			LeaderID:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      ents,
+			LeaderCommit: rf.log.commitIndex,
+		}
+		go func(i int) {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAndHandleAppendEntries(i, args, reply)
+			ok = ok && (reply.Term <= rf.Term)
+			resp <- ok
+		}(i)
+	}
+	t, ack := time.NewTimer(time.Second), 1
+	defer t.Stop()
+	for {
+		select {
+		case ok := <-resp:
+		  if ok {
+				ack++
+			}
+			if ack >= len(rf.peers)/2 + 1 {
+				return true
+			}
+		case <-t.C:
+			return false
+		}
 	}
 }
 

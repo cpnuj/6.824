@@ -51,7 +51,7 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	if _, isLead := kv.rf.GetState(); !isLead {
+	if isLead := kv.rf.CheckQuorum(); !isLead {
 		reply.Err = NotLead
 		return
 	}
