@@ -1,14 +1,16 @@
 package raft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"bytes"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"../labgob"
+	"../labrpc"
 )
 
 //
@@ -86,7 +88,7 @@ func (rl *raftLog) DeleteFrom(from int) {
 }
 
 func (rl *raftLog) Entry(i int) Entry {
-  return rl.entries[i - rl.off]
+	return rl.entries[i-rl.off]
 }
 
 func (rl *raftLog) Entries() []Entry {
@@ -502,13 +504,13 @@ type raftSnapshot struct {
 }
 
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-  if index > rf.snapshot.lastIncludedIndex {
-  	rf.snapshot.lastIncludedIndex = index
-  	rf.snapshot.lastIncludedTerm = rf.log.entries[index].Term
-  	rf.snapshot.data = snapshot
-  	// compact log
-  	rf.log.off = index+1
-  	rf.log.entries = rf.log.entries[rf.log.off:]
+	if index > rf.snapshot.lastIncludedIndex {
+		rf.snapshot.lastIncludedIndex = index
+		rf.snapshot.lastIncludedTerm = rf.log.entries[index].Term
+		rf.snapshot.data = snapshot
+		// compact log
+		rf.log.off = index + 1
+		rf.log.entries = rf.log.entries[rf.log.off:]
 	}
 }
 
@@ -779,10 +781,34 @@ func (rf *Raft) handleRequestVoteReply(args *RequestVoteArgs, reply *RequestVote
 	}
 }
 
+func fmtAppendEntriesArgs(args *AppendEntriesArgs) string {
+	ret := fmt.Sprintf("[debug appa] from: %d term: %d prev_idx: %d prev_term: %d commit: %d ents: [",
+		args.LeaderID, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+
+	ents := args.Entries
+	for i := range ents {
+		ret += fmt.Sprintf("<i=%d t=%d : %v> ", args.PrevLogIndex+i, ents[i].Term, ents[i].Command)
+	}
+
+	ret += "]"
+	return ret
+}
+
+func fmtAppendEntriesReply(reply *AppendEntriesReply) string {
+	ret := fmt.Sprintf("[debug repl] from: %d term: %d hint_idx: %d hint_term: %d succ: %v",
+		reply.From, reply.Term, reply.HintIndex, reply.HintTerm, reply.Success)
+	return ret
+}
+
 //
 // Append Entries RPC Handler
 //
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("%s\n", fmtAppendEntriesArgs(args))
+	defer func() {
+		DPrintf("%s\n", fmtAppendEntriesReply(reply))
+	}()
+
 	reply.From = rf.me
 	reply.Term = rf.Term
 
@@ -814,6 +840,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		reply.Success = false
 		return
 	}
+	DPrintf("[debug in: %d] prev ents: %v", rf.me, rf.log.Entries())
 	reply.Success = true
 	ents := args.Entries
 	bi := args.PrevLogIndex + 1
@@ -830,6 +857,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		rf.log.DeleteFrom(bi)
 		rf.log.Append(ents)
 	}
+	DPrintf("[debug in: %d] after ents: %v", rf.me, rf.log.Entries())
 	if args.LeaderCommit > rf.log.CommitIndex() {
 		oldci, newci := rf.log.CommitIndex(), min(args.LeaderCommit, rf.log.LastIndex())
 		if ok := rf.log.CommitTo(newci); ok {
@@ -881,7 +909,7 @@ func (rf *Raft) tryCommit() {
 
 	// cannot commit entries from previous term
 	if rf.log.Entry(newci).Term == rf.Term {
-	  rf.log.CommitTo(newci)
+		rf.log.CommitTo(newci)
 		rf.apply(oldci+1, newci)
 	}
 }
@@ -898,7 +926,7 @@ func (rf *Raft) handleAppendEntriesReply(args *AppendEntriesArgs, reply *AppendE
 	pg := rf.pt[from]
 	if reply.Success {
 		if pg.state == StateProbe {
-		  pg.state = StateReplicate
+			pg.state = StateReplicate
 		}
 		pg.match = max(pg.match, args.PrevLogIndex+len(args.Entries))
 		pg.next = pg.match + 1
