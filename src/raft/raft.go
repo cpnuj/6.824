@@ -246,6 +246,11 @@ type Raft struct {
 	applyCh chan ApplyMsg
 	tick    func()
 
+	// syncWithLeader is used in follower state. Set to true when the follower
+	// first accepts the leader's log in this term, then this follower just
+	// accepts unreceived logs from leader's AppendEntries rpc in this term.
+	syncWithLeader bool
+
 	electionElapsed   int
 	heartbeatElapsed  int
 	electionTimeout   int
@@ -602,6 +607,7 @@ func (rf *Raft) becomeFollower(term, votedFor int) {
 	rf.VotedFor = votedFor
 	rf.tick = rf.tickElection
 	rf.electionElapsed = 0
+	rf.syncWithLeader = false
 }
 
 func (rf *Raft) becomePreCandidate() {
@@ -819,13 +825,12 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	if rf.Term < args.Term {
 		rf.becomeFollower(args.Term, args.LeaderID)
 	}
+
 	// now rf.Term == args.Term
 	switch rf.role {
 	case Follower:
 		rf.electionElapsed = 0
-	case Candidate:
-		fallthrough
-	case PreCandidate:
+	case Candidate, args.PrevLogTerm:
 		rf.becomeFollower(args.Term, args.LeaderID)
 	case Leader:
 		log.Fatalf("[error] Term %d has two leaders %d and %d",
@@ -840,24 +845,25 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		reply.Success = false
 		return
 	}
+
 	DPrintf("[debug in: %d] prev ents: %v", rf.me, rf.log.Entries())
+
 	reply.Success = true
-	ents := args.Entries
-	bi := args.PrevLogIndex + 1
-	// find the conflict log pos to start append
-	// can avoid deleting the correct appended entries
-	for _, e := range args.Entries {
-		if !rf.log.Match(bi, e.Term) {
-			break
+
+	if !rf.syncWithLeader {
+		rf.syncWithLeader = true
+		// TODO: make append log fast
+		rf.log.entries = append(rf.log.entries[:args.PrevLogIndex+1], args.Entries...)
+	} else {
+		haveNewLog := args.PrevLogIndex+len(args.Entries) > rf.log.LastIndex()
+		if haveNewLog {
+			// TODO: make append log fast
+			rf.log.entries = append(rf.log.entries[:args.PrevLogIndex+1], args.Entries...)
 		}
-		bi++
-		ents = ents[1:]
 	}
-	if len(ents) > 0 {
-		rf.log.DeleteFrom(bi)
-		rf.log.Append(ents)
-	}
+
 	DPrintf("[debug in: %d] after ents: %v", rf.me, rf.log.Entries())
+
 	if args.LeaderCommit > rf.log.CommitIndex() {
 		oldci, newci := rf.log.CommitIndex(), min(args.LeaderCommit, rf.log.LastIndex())
 		if ok := rf.log.CommitTo(newci); ok {
