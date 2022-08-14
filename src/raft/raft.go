@@ -18,17 +18,17 @@ package raft
 //
 
 import (
+	"bytes"
 	"log"
 	"math/rand"
 	"sort"
 	"sync"
 	"time"
 )
+
 import "sync/atomic"
 import "../labrpc"
-
-// import "bytes"
-// import "../labgob"
+import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -56,6 +56,7 @@ type Entry struct {
 const (
 	Leader int = iota
 	Candidate
+	PreCandidate
 	Follower
 )
 
@@ -156,6 +157,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	enc := labgob.NewEncoder(w)
+	enc.Encode(rf.term)
+	enc.Encode(rf.voteFor)
+	enc.Encode(rf.startIndex)
+	enc.Encode(rf.commitIndex)
+	enc.Encode(rf.appliedIndex)
+	enc.Encode(rf.entries)
+	rf.persister.SaveRaftState(w.Bytes())
 }
 
 //
@@ -178,6 +188,28 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var (
+		term         int
+		voteFor      int
+		startIndex   int
+		commitIndex  int
+		appliedIndex int
+		entries      []Entry
+	)
+	if d.Decode(&term) != nil || d.Decode(&voteFor) != nil ||
+		d.Decode(&startIndex) != nil || d.Decode(&commitIndex) != nil ||
+		d.Decode(&appliedIndex) != nil || d.Decode(&entries) != nil {
+		log.Fatalf("readPersist decode error")
+	} else {
+		rf.term = term
+		rf.voteFor = voteFor
+		rf.startIndex = startIndex
+		rf.commitIndex = commitIndex
+		rf.appliedIndex = appliedIndex
+		rf.entries = entries
+	}
 }
 
 //
@@ -190,6 +222,7 @@ type RequestVoteArgs struct {
 	Term      int
 	LastTerm  int
 	LastIndex int
+	PreVote   bool
 
 	ReplyCh chan *RequestVoteReply
 }
@@ -200,9 +233,10 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	From int
-	Term int
-	Succ bool
+	From    int
+	Term    int
+	Succ    bool
+	PreVote bool
 }
 
 //
@@ -287,21 +321,39 @@ func (rf *Raft) becomeFollower() {
 	rf.electionElapsed = 0
 }
 
+func (rf *Raft) becomePreCandidate() {
+	rf.state = PreCandidate
+	rf.votesAck = make(map[int]struct{})
+	rf.votesAck[rf.me] = struct{}{}
+	args := &RequestVoteArgs{
+		From:      rf.me,
+		Term:      rf.term + 1,
+		LastTerm:  rf.termOfIndex(rf.lastIndex()),
+		LastIndex: rf.lastIndex(),
+		PreVote:   true,
+	}
+	rf.sendVoteReqs(args)
+	DPrintf("[peer %d] become pre candidate in term %d", rf.me, rf.term)
+}
+
 func (rf *Raft) becomeCandidate() {
 	rf.state = Candidate
 	rf.voteFor = rf.me
 	rf.electionElapsed = 0
-
 	rf.votesAck = make(map[int]struct{})
 	rf.votesAck[rf.me] = struct{}{}
-
-	// broadcast vote request
 	args := &RequestVoteArgs{
 		From:      rf.me,
 		Term:      rf.term,
 		LastTerm:  rf.termOfIndex(rf.lastIndex()),
 		LastIndex: rf.lastIndex(),
+		PreVote:   false,
 	}
+	rf.sendVoteReqs(args)
+	DPrintf("[peer %d] become candidate in term %d", rf.me, rf.term)
+}
+
+func (rf *Raft) sendVoteReqs(args *RequestVoteArgs) {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -314,8 +366,6 @@ func (rf *Raft) becomeCandidate() {
 			}
 		}()
 	}
-
-	DPrintf("[peer %d] become candidate in term %d", rf.me, rf.term)
 }
 
 func (rf *Raft) becomeLeader() {
@@ -407,17 +457,23 @@ func (rf *Raft) sendEntries() {
 
 func (rf *Raft) tick() {
 	switch rf.state {
-	case Follower, Candidate:
+	case Follower, PreCandidate:
 		rf.electionElapsed++
 		if rf.electionElapsed > rf.electionTimeout {
-			rf.term++
-			rf.becomeCandidate()
+			rf.electionElapsed = 0
+			rf.becomePreCandidate()
+		}
+	case Candidate:
+		rf.electionElapsed++
+		if rf.electionElapsed > rf.electionTimeout {
+			rf.electionElapsed = 0
+			rf.becomeFollower()
 		}
 	case Leader:
 		rf.heartbeatElapsed++
 		if rf.heartbeatElapsed > rf.heartbeatTimeout {
-			rf.sendEntries()
 			rf.heartbeatElapsed = 0
+			rf.sendEntries()
 		}
 	}
 }
@@ -434,10 +490,29 @@ func (rf *Raft) handleRequestVoteArgs(args *RequestVoteArgs) {
 		reply.Succ = false
 		return
 	}
+
+	termNewer := args.LastTerm > rf.termOfIndex(rf.lastIndex())
+	termSame := args.LastTerm == rf.termOfIndex(rf.lastIndex())
+	logLonger := args.LastIndex >= rf.lastIndex()
+	candidateLogNewer := termNewer || (termSame && logLonger)
+
+	if args.PreVote {
+		reply.Term = args.Term
+		reply.PreVote = true
+		if candidateLogNewer {
+			reply.Succ = true
+		} else {
+			reply.Succ = false
+		}
+		return
+	} else {
+		reply.PreVote = false
+	}
+
 	if args.Term > rf.term {
 		rf.term = args.Term
 		switch rf.state {
-		case Leader, Candidate:
+		case Leader, PreCandidate, Candidate:
 			rf.becomeFollower()
 		case Follower:
 			rf.voteFor = nonVote
@@ -445,10 +520,8 @@ func (rf *Raft) handleRequestVoteArgs(args *RequestVoteArgs) {
 	}
 	// args.Term == rf.term
 	reply.Term = rf.term
-	// TODO: clean code
 	if rf.state == Follower && rf.voteFor == nonVote {
-		if args.LastTerm > rf.termOfIndex(rf.lastIndex()) ||
-			(args.LastTerm == rf.termOfIndex(rf.lastIndex()) && args.LastIndex >= rf.lastIndex()) {
+		if candidateLogNewer {
 			rf.electionElapsed = 0
 			rf.voteFor = args.From
 			reply.Succ = true
@@ -461,18 +534,39 @@ func (rf *Raft) handleRequestVoteArgs(args *RequestVoteArgs) {
 }
 
 func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
-	if reply.Term < rf.term {
-		return
-	}
-	if reply.Term > rf.term {
-		rf.term = reply.Term
-		rf.becomeFollower()
-		return
-	}
-	if rf.state == Candidate && reply.Succ {
-		rf.votesAck[reply.From] = struct{}{}
-		if len(rf.votesAck) > len(rf.peers)/2 {
-			rf.becomeLeader()
+	if reply.PreVote {
+		if rf.state != PreCandidate {
+			return
+		}
+		if reply.Term < rf.term+1 {
+			return
+		}
+		if reply.Term > rf.term+1 {
+			rf.term = reply.Term
+			rf.becomeFollower()
+			return
+		}
+		if reply.Succ {
+			rf.votesAck[reply.From] = struct{}{}
+			if len(rf.votesAck) > len(rf.peers)/2 {
+				rf.term++
+				rf.becomeCandidate()
+			}
+		}
+	} else {
+		if reply.Term < rf.term {
+			return
+		}
+		if reply.Term > rf.term {
+			rf.term = reply.Term
+			rf.becomeFollower()
+			return
+		}
+		if rf.state == Candidate && reply.Succ {
+			rf.votesAck[reply.From] = struct{}{}
+			if len(rf.votesAck) > len(rf.peers)/2 {
+				rf.becomeLeader()
+			}
 		}
 	}
 }
@@ -495,8 +589,7 @@ func (rf *Raft) handleAppendEntriesArgs(args *AppendEntriesArgs) {
 	switch rf.state {
 	case Leader:
 		log.Fatalf("[peer %d] two leaders in term %d", rf.me, rf.term)
-
-	case Candidate:
+	case Candidate, PreCandidate:
 		rf.becomeFollower()
 		rf.voteFor = args.From
 		fallthrough
@@ -538,6 +631,9 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
 		rf.becomeFollower()
 		return
 	}
+	if rf.state != Leader {
+		return
+	}
 	if reply.Succ {
 		rf.matchIndex[reply.From] = max(rf.matchIndex[reply.From], reply.MatchIndex)
 		rf.nextIndex[reply.From] = rf.matchIndex[reply.From] + 1
@@ -572,7 +668,6 @@ func (rf *Raft) run() {
 	timer := time.NewTimer(tickDuration)
 
 	for {
-		oldCommit := rf.commitIndex
 		select {
 		// time module
 		case <-timer.C:
@@ -600,17 +695,19 @@ func (rf *Raft) run() {
 			rf.handleStartRequest(req)
 		}
 		// TODO: ugly apply
-		DPrintf("[peer %d] old commit %d new commit %d", rf.me, oldCommit, rf.commitIndex)
-		if rf.commitIndex > oldCommit {
-			for i := oldCommit + 1; i <= rf.commitIndex; i++ {
+		DPrintf("[peer %d] apply %d new commit %d", rf.me, rf.appliedIndex, rf.commitIndex)
+		if rf.commitIndex > rf.appliedIndex {
+			for i := rf.appliedIndex + 1; i <= rf.commitIndex; i++ {
 				committed := rf.entries[i-rf.startIndex]
 				rf.applyCh <- ApplyMsg{
 					CommandValid: true,
 					Command:      committed.Command,
 					CommandIndex: committed.Index,
 				}
+				rf.appliedIndex++
 			}
 		}
+		rf.persist()
 	}
 }
 
@@ -667,6 +764,34 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) initVolatile() {
+	rf.state = Follower
+
+	// election timeout range 200ms to 400ms
+	// our ticker should tick every 10ms
+	rf.electionElapsed = 0
+	rf.electionTimeout = rand.Intn(20) + 20
+	// heartbeat timeout every 150ms
+	rf.heartbeatTimeout = 15
+
+	rf.requestVoteArgsCh = make(chan *RequestVoteArgs, 100)
+	rf.requestVoteReplyCh = make(chan *RequestVoteReply, 100)
+	rf.appendEntriesArgsCh = make(chan *AppendEntriesArgs, 100)
+	rf.appendEntriesReplyCh = make(chan *AppendEntriesReply, 100)
+
+	rf.getStateReqCh = make(chan *GetStateRequest, 100)
+	rf.startReqCh = make(chan *StartRequest, 100)
+}
+
+func (rf *Raft) initPersist() {
+	rf.term = 0
+	rf.voteFor = nonVote
+	rf.startIndex = 0
+	rf.commitIndex = 0
+	rf.appliedIndex = 0
+	rf.entries = []Entry{{Term: 0, Index: 0, Command: nil}}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -686,34 +811,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	if data := persister.ReadRaftState(); len(data) > 0 {
+		rf.readPersist(persister.ReadRaftState())
+	} else {
+		rf.initPersist()
+	}
+	rf.initVolatile()
 
 	rf.applyCh = applyCh
-
-	rf.term = 0
-	rf.becomeFollower()
-
-	rf.entries = []Entry{{Term: 0, Index: 0, Command: nil}}
-	rf.startIndex = 0
-	rf.commitIndex = 0
-	rf.appliedIndex = 0
-
-	// election timeout range 200ms to 400ms
-	// our ticker should tick every 10ms
-	rf.electionElapsed = 0
-	rf.electionTimeout = rand.Intn(20) + 20
-	// heartbeat timeout every 150ms
-	rf.heartbeatTimeout = 15
-
-	rf.requestVoteArgsCh = make(chan *RequestVoteArgs, 100)
-	rf.requestVoteReplyCh = make(chan *RequestVoteReply, 100)
-	rf.appendEntriesArgsCh = make(chan *AppendEntriesArgs, 100)
-	rf.appendEntriesReplyCh = make(chan *AppendEntriesReply, 100)
-
-	rf.getStateReqCh = make(chan *GetStateRequest, 100)
-	rf.startReqCh = make(chan *StartRequest, 100)
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	go rf.run()
 
