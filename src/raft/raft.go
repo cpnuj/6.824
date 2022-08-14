@@ -60,7 +60,7 @@ const (
 )
 
 const nonVote = -1
-const MaxLogSize = 10
+const MaxLogSize = 100
 
 //
 // A Go object implementing a single Raft peer.
@@ -435,12 +435,11 @@ func (rf *Raft) handleRequestVoteArgs(args *RequestVoteArgs) {
 		return
 	}
 	if args.Term > rf.term {
+		rf.term = args.Term
 		switch rf.state {
 		case Leader, Candidate:
-			rf.term = args.Term
 			rf.becomeFollower()
 		case Follower:
-			rf.term = args.Term
 			rf.voteFor = nonVote
 		}
 	}
@@ -450,6 +449,7 @@ func (rf *Raft) handleRequestVoteArgs(args *RequestVoteArgs) {
 	if rf.state == Follower && rf.voteFor == nonVote {
 		if args.LastTerm > rf.termOfIndex(rf.lastIndex()) ||
 			(args.LastTerm == rf.termOfIndex(rf.lastIndex()) && args.LastIndex >= rf.lastIndex()) {
+			rf.electionElapsed = 0
 			rf.voteFor = args.From
 			reply.Succ = true
 		} else {
@@ -564,6 +564,7 @@ func (rf *Raft) handleStartRequest(req *StartRequest) {
 		Index:    index,
 		IsLeader: true,
 	}
+	rf.sendEntries()
 }
 
 func (rf *Raft) run() {
@@ -696,7 +697,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.appliedIndex = 0
 
-	// election timeout range 150ms to 300ms
+	// election timeout range 200ms to 400ms
 	// our ticker should tick every 10ms
 	rf.electionElapsed = 0
 	rf.electionTimeout = rand.Intn(20) + 20
